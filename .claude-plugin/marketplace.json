@@ -1,14 +1,14 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "codex-claude-duo",
-  "description": "Bidirectional local collaboration between Claude Code and Codex.",
+  "description": "Unlimited-by-default bidirectional local collaboration with no bridge wall-clock timeout, persistent idle sessions, and routed control discovery for Claude Code and Codex.",
   "owner": {
     "name": "Portal Universidade"
   },
   "plugins": [
     {
       "name": "codex-peer",
-      "description": "Let Claude Code invoke a policy-bound Codex peer through Codex's official MCP server.",
+      "description": "Let Claude Code invoke an unlimited-by-default Codex peer through background operations with no bridge wall-clock timeout or idle expiry, and query the shared control catalog.",
       "author": {
         "name": "Portal Universidade"
       },

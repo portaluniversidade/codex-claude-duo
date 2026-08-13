@@ -1,6 +1,6 @@
 # Codex + Claude Duo
 
-This bundle provides a bidirectional local collaboration bridge. Codex can bring a locally authenticated Claude Code agent into its task, and an interactive Claude Code window can independently invoke a locally authenticated Codex peer through Codex's official MCP server. Either host may invoke the other proactively when an independent implementation or review pass materially helps; a separate “ask the other agent” request is not required.
+This bundle provides a bidirectional local collaboration bridge. Codex can bring a locally authenticated Claude Code agent into its task, and an interactive Claude Code window can independently invoke a locally authenticated Codex peer through Codex's official MCP server. Either host may invoke the other proactively when an independent implementation or review pass materially helps; a separate “ask the other agent” request is not required. New peer sessions have unlimited cross-agent follow-ups by default. A numerical cap is applied only when the user explicitly asks for concise, bounded, one-pass, or an exact number of rounds.
 
 The Codex-to-Claude direction has two deliberately different collaboration surfaces:
 
@@ -23,11 +23,12 @@ The full phase starts the native Claude Code CLI with:
 - `--permission-mode auto`, which lets Claude work autonomously without routine permission prompts while retaining Anthropic's background safety classifier;
 - file editing, shell execution, tests, Claude subagents, WebSearch, and WebFetch;
 - persistent opaque sessions that Codex can continue with follow-up instructions;
+- no bridge-imposed follow-up count unless `maxFollowUps` is deliberately supplied;
 - visible rolling aliases and exact model presets, with Fable-first ordered fallback and per-call model evidence;
 - selectable reasoning/workflow settings with deepest reasoning (`max`) as the default;
 - Max-subscription OAuth, not an Anthropic API key.
 
-It is “full built-in Claude Code,” not a byte-for-byte relay of the interactive terminal UI. Headless `claude -p` does not expose interactive slash-command menus or permission dialogs, and this bridge intentionally disables user/project Claude settings, custom hooks, custom MCP servers, Chrome integration, and recursive Claude/Codex launches. Those exclusions keep the two-agent bridge reproducible and prevent an unreviewed local configuration from silently changing what runs.
+It is “full built-in Claude Code,” not a byte-for-byte relay of the interactive terminal UI. Headless `claude -p` gives the invoked model its advertised agent tools and bundled skills, but terminal slash-command preprocessing, permission dialogs, clipboard actions, account pickers, themes, and other local UI controls are not MCP model tools. The bridge intentionally disables user/project Claude settings, custom hooks, custom MCP servers, Chrome integration, and recursive Claude/Codex launches. Those exclusions keep the two-agent bridge reproducible and prevent an unreviewed local configuration from silently changing what runs.
 
 Native Windows does not provide Claude Code's Linux command sandbox. The full phase can make real changes anywhere its shell credentials and OS account can reach; the workspace-root check is an orchestration boundary, not an operating-system sandbox. Use the isolated implementation phase for stronger path accounting, or run the full agent inside a VM/WSL/container if an OS boundary is required.
 
@@ -58,7 +59,7 @@ flowchart LR
 
 Codex remains the coordinator: it owns the user's scope, decides what evidence to reconcile, checks both agents' work, and gives the final answer. Claude output and repository text remain untrusted task material; neither can expand authorization to commit, push, deploy, make purchases, send messages, or contact third parties.
 
-When Claude Code is the interactive host, the relationship mirrors cleanly: Claude owns the user-facing scope and final reconciliation, while Codex acts as the independent peer. The invoked peer is never allowed to call back into the host. Codex-launched Claude has strict empty MCP/settings sources; Claude-launched Codex starts with plugins, apps, hooks, and configured MCP servers disabled. This prevents Codex -> Claude -> Codex and Claude -> Codex -> Claude recursion in both directions.
+When Claude Code is the interactive host, the relationship mirrors cleanly: Claude owns the user-facing scope and final reconciliation, while Codex acts as the independent peer. Codex-launched Claude has strict empty MCP/settings sources; Claude-launched Codex starts with plugins, apps, hooks, and configured MCP servers disabled. Those settings technically close the nested MCP/plugin/app/hook routes. Both peers also receive developer instructions forbidding shell-level relaunch of either coordinator; that shell prohibition is instruction enforcement, not an operating-system impossibility.
 
 ## One-time setup
 
@@ -233,36 +234,54 @@ When Claude is already running a long inference, use Codex's `/btw` command for 
 
 ## MCP tools
 
-The plugin exposes eight tools:
+The Codex-side plugin exposes thirteen tools. Every inference tool queues work and returns an operation handle immediately:
 
 | Tool | Capability | Default conversation budget |
 |---|---|---:|
-| `claude_full` | Full built-in tools, direct workspace writes, commands, tests, web tools | Initial response + 6 continuations |
-| `claude_full_reply` | Continue the same full session | Counts against the bounded session, or uncapped for an explicit unlimited session |
-| `claude_full_unlimited` | Full built-in tools with no bridge reply ceiling | Explicit consent required |
-| `claude_plan` | Read-only deep review with Read/Glob | Initial response + 6 continuations |
-| `claude_reply` | Continue a read-only review | Counts against bounded session, or uncapped for an explicit unlimited session |
-| `claude_plan_unlimited` | Read-only review with no bridge reply ceiling | Explicit consent required |
+| `claude_full` | Full built-in tools, direct workspace writes, commands, tests, web tools | Unlimited follow-ups by default |
+| `claude_full_reply` | Continue the same full session | No numerical cap unless `maxFollowUps` was set |
+| `claude_full_unlimited` | Compatibility alias for an unlimited full session | Legacy confirmation required |
+| `claude_plan` | Read-only deep review with Read/Glob | Unlimited follow-ups by default |
+| `claude_reply` | Continue a read-only review | No numerical cap unless `maxFollowUps` was set |
+| `claude_plan_unlimited` | Compatibility alias for an unlimited review | Legacy confirmation required |
 | `claude_implement` | One-use, path-scoped edits in a clean linked worktree; no shell | One implementation call |
 | `claude_status` | Read-only CLI/auth/root/policy diagnostic | No inference |
+| `claude_capabilities` | Paginated Claude/Codex control catalog with access routes | No inference |
+| `claude_operation` | Poll one operation or list all connection-resident operations | No inference |
+| `claude_operation_cancel` | Explicitly cancel one queued/running operation | No inference |
+| `claude_sessions` | List persistent opaque sessions | No inference |
+| `claude_session_close` | Explicitly close one idle session | No inference |
 
-All session continuation tools use an opaque bridge handle and a monotonically increasing `expectedReplyNumber`. A stale retry is rejected before inference, and a failed, timed-out, cancelled, or identity-mismatched continuation closes the handle rather than risking a forked conversation.
+All session continuation tools use an opaque bridge handle and a monotonically increasing `expectedReplyNumber`. A stale retry is rejected before inference, and a failed, explicitly cancelled, host-interrupted, or identity-mismatched continuation closes the handle rather than risking a forked conversation. Omit `maxFollowUps` for the default unlimited policy. Any non-negative safe integer is accepted only when the user asks for a concise or bounded request; `0` means initial response only.
 
 ## Claude Code -> Codex reciprocal peer
 
-The Claude Code plugin lives under `claude-plugins/codex-peer` and wraps the official experimental `codex mcp-server` rather than reimplementing Codex's thread protocol. Its policy proxy exposes seven Claude-side tools:
+The Claude Code plugin lives under `claude-plugins/codex-peer` and wraps the official experimental `codex mcp-server` rather than reimplementing Codex's thread protocol. Its policy proxy exposes twelve Claude-side tools. Inference starts and replies return operation handles immediately:
 
 | Tool | Capability | Default conversation budget |
 |---|---|---:|
-| `codex_plan` | Read-only independent Codex review | Initial response + 6 continuations |
-| `codex_reply` | Continue the matching read-only session | Counts against the bounded session, or uncapped for explicit unlimited mode |
-| `codex_plan_unlimited` | Read-only session with no numerical reply cap | Explicit consent required |
-| `codex_full` | Workspace-write Codex agent with network disabled | Initial response + 6 continuations |
-| `codex_full_reply` | Continue the matching workspace-write session | Counts against the bounded session, or uncapped for explicit unlimited mode |
-| `codex_full_unlimited` | Workspace-write session with no numerical reply cap | Explicit consent required |
+| `codex_plan` | Read-only independent Codex review | Unlimited follow-ups by default |
+| `codex_reply` | Continue the matching read-only session | No numerical cap unless `maxFollowUps` was set |
+| `codex_plan_unlimited` | Compatibility alias for an unlimited review | Legacy confirmation required |
+| `codex_full` | Workspace-write Codex agent with network disabled | Unlimited follow-ups by default |
+| `codex_full_reply` | Continue the matching workspace-write session | No numerical cap unless `maxFollowUps` was set |
+| `codex_full_unlimited` | Compatibility alias for an unlimited workspace session | Legacy confirmation required |
 | `codex_status` | CLI/login/workspace/MCP/recursion diagnostic | No inference |
+| `codex_capabilities` | Paginated Claude/Codex control catalog with access routes | No inference |
+| `codex_operation` | Poll one operation or list all connection-resident operations | No inference |
+| `codex_operation_cancel` | Explicitly cancel one queued/running operation | No inference |
+| `codex_sessions` | List persistent opaque sessions | No inference |
+| `codex_session_close` | Explicitly close one idle session | No inference |
 
-No reciprocal tool accepts `cwd`: the MCP server canonicalizes `CLAUDE_PROJECT_DIR` once at startup and uses that exact root for every Codex turn. Raw Codex thread IDs never enter Claude's context; the proxy replaces them with opaque handles and monotonic reply numbers. Read-only calls pin `sandbox=read-only`; write-capable calls pin `sandbox=workspace-write`; both pin `approval-policy=never`, disable workspace-write network access, serialize inference, emit progress, enforce timeouts, cap output, redact common secret formats, and close ambiguous sessions after failure.
+No reciprocal tool accepts `cwd`: the MCP server canonicalizes `CLAUDE_PROJECT_DIR` once at startup and uses that exact root for every Codex turn. Raw Codex thread IDs never enter Claude's context; the proxy replaces them with opaque handles and monotonic reply numbers. Read-only calls pin `sandbox=read-only`; write-capable calls pin `sandbox=workspace-write`; both pin `approval-policy=never`, disable workspace-write network access, serialize inference, cap output, redact common secret formats, and close ambiguous sessions after failure. There is no bridge wall-clock timeout.
+
+### Long-running operations and persistent idle sessions
+
+The bridge does not keep a client request open while an agent works. `claude_plan`, `claude_full`, their continuation tools, and their Codex equivalents return a UUID operation handle as soon as the request is accepted. Poll `claude_operation` or `codex_operation` until `status` is `completed`, `error`, or `cancelled`. A five-minute caller wait limit, dropped waiter, `/btw` side question, or temporary lack of polling does not send cancellation and does not terminate the child agent. Operation records have no bridge expiry while that MCP bridge process remains alive.
+
+Idle conversation sessions have no timeout. Their opaque-to-native session mapping is written outside the plugin cache and is loaded by replacement MCP bridge processes, so plugin refreshes and ordinary bridge restarts do not erase clean idle sessions. Use `claude_session_close` or `codex_session_close` to disconnect one explicitly. A continuation is marked in-flight before launch; if the bridge host dies during that continuation, the ambiguous handle is discarded on restart rather than being replayed unsafely.
+
+An MCP host process, operating-system shutdown, native CLI crash, logout, provider-side invalidation, or provider allowance failure can still end an active process. No child process can remain connected after its owning host and stdio transport cease to exist. Those are reported as host/provider failures, separately from the bridge's own policy: the bridge itself applies no wall-clock cutoff and no idle disconnect.
 
 `workspace-write` is Codex's filesystem sandbox policy, not a VM. It permits reads according to Codex's platform policy and writes in the bound workspace. The reciprocal v1 bridge intentionally does not expose `danger-full-access`. Use a disposable branch, worktree, container, or VM for high-risk work.
 
@@ -271,6 +290,42 @@ On Windows, the launcher prefers the real WinGet package-local `codex.exe` over 
 The Claude-side skill standardizes a handoff packet (`USER GOAL`, `WORKSPACE`, `CLAUDE VIEW`, `EVIDENCE`, `REQUEST TO CODEX`, and `RETURN`) so Codex receives the original authorization boundary and returns evidence that Claude can independently verify.
 
 A failed full-agent call may already have written files or caused command side effects. Such errors return `workspaceMayContainPartialChanges: true`, `automaticRollbackPerformed: false`, and `inspectionRequired: true`. Inspect the workspace, diff, tests, and any relevant external state before retrying.
+
+## Complete control coverage and truthful access
+
+Both bridge directions ship the same generated `control-catalog.json` and expose it through `claude_capabilities` and `codex_capabilities`. Exhaustive callers paginate until `nextOffset` is `null`. The 2026-08-13 snapshot contains 815 routed entries:
+
+| Product surface | Captured controls |
+|---|---:|
+| Claude official interactive commands | 106 |
+| Claude commands observed beyond the public table | 13 |
+| Claude CLI commands / options | 34 / 75 |
+| Claude live agent tools / bundled skills | 33 / 19 |
+| Claude official shortcuts / Vim controls / observed shortcuts | 52 / 59 / 15 |
+| Claude reciprocal tools | 13 |
+| Codex TUI commands | 50 |
+| Codex CLI commands / global options / subcommand options | 28 / 20 / 113 |
+| Codex Security commands / options / CLI interactive shortcuts | 14 / 31 / 9 |
+| Codex desktop shortcuts / deep links / link parameters | 21 / 19 / 12 |
+| Codex IDE commands / settings / IDE slash commands | 6 / 10 / 22 |
+| Codex Micro hardware controls | 27 |
+| Codex official MCP tools / reciprocal tools | 2 / 12 |
+
+The generator fails if any of the 100 commands visible in the supplied Claude Code 2.1.231 screenshots, any of the 46 command identifiers from the live Claude headless initialization probe, the 14 Codex Security commands, all 31 documented Codex Security options, the 9 Codex CLI interactive shortcuts, or the repaired `chatgpt.newChat` IDE command is absent. It records SHA-256 hashes for the fetched Claude command, CLI, and interactive-mode references plus the Codex manual. The live inventory is a union of both 2.1.231 probes (`Task` and `Agent`, plus 19 observed bundled skills) and retains each probe separately so runtime drift is explicit.
+
+```powershell
+node .\scripts\update-control-catalogs.mjs `
+  --codex-manual "$env:LOCALAPPDATA\Temp\openai-docs-cache\codex-manual.md"
+```
+
+“Known” and “callable” are deliberately separate:
+
+- `peer-direct`, `peer-agent`, and `bridge-equivalent` identify a direct reciprocal tool or a semantic outcome the invoked agent can perform;
+- `bridge-controlled` and `bridge-runtime` identify launch/runtime policy owned by the bridge rather than arbitrary caller-supplied CLI arguments;
+- `interactive-host-only`, `host-cli-only`, `host-launch-only`, and `host-link` identify terminal, desktop, editor, account, clipboard, or session controls that both agents know but cannot truthfully operate as remote MCP buttons;
+- `conditional-host` and `conditional-external` also depend on current plan, platform, organization policy, feature flags, installed plugin/MCP state, and exact top-level authorization.
+
+For UI-only slash commands, the other agent requests the semantic outcome through `claude_plan`/`claude_full` or `codex_plan`/`codex_full`, or asks the interactive user/host to invoke the actual UI control. This provides complete routed knowledge for the captured versions without falsely claiming that a headless agent can press another application's controls. Because both products are updated independently and expose conditional commands, the catalog's completeness promise is versioned: complete for its cited documentation, screenshots, and live probes, not a timeless guarantee about future or account-specific commands.
 
 ## Model, effort, and fallback selection
 
@@ -290,11 +345,11 @@ Supported model selectors are visible in the tool schema:
 | current exact presets | `claude-fable-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-haiku-4-5` |
 | other `claude-*` IDs | Any syntactically valid first-party exact ID, optionally with `[1m]`; full mode requires Fable 5+, Opus 4.6+, or Sonnet 4.6+ compatibility |
 
-The bridge default is `model: "fable"`. On the installed Claude Code 2.1.227, `opus` resolves to Opus 5 and `sonnet` resolves to Sonnet 5 on the Anthropic first-party provider. Rolling aliases follow Anthropic upgrades; use an exact ID when reproducibility matters.
+The bridge default is `model: "fable"`. On the probed Claude Code 2.1.231, `opus` resolves to Opus 5 and `sonnet` resolves to Sonnet 5 on the Anthropic first-party provider. Rolling aliases follow Anthropic upgrades; use an exact ID when reproducibility matters.
 
 The default availability chain is Fable → Opus → Sonnet. The bridge passes it through Claude Code's `--fallback-model` flag, which only switches for overload, unavailability, or another eligible non-retryable server error. Authentication, billing, rate, request-size, and transport failures do not trigger that chain. Each new turn tries the primary again. Selecting a different primary derives the lower capability chain (`opus` → `sonnet`; Sonnet and Haiku have no automatic lower fallback), while an explicit `fallbackModels` array overrides the chain and `fallbackModels: []` disables it.
 
-Anthropic's content-safety fallback is separate from this availability chain. As of Claude Code 2.1.227, flagged Fable biology requests route to Opus 5 and flagged Fable cybersecurity requests route to Opus 4.8; Opus 5 can route flagged cybersecurity requests to Opus 4.8, while a biology refusal on Opus 5 has no lower safety fallback. The bridge never manually retries a refusal to evade these safeguards.
+Anthropic's content-safety fallback is separate from this availability chain. As of the probed Claude Code 2.1.231, flagged Fable biology requests route to Opus 5 and flagged Fable cybersecurity requests route to Opus 4.8; Opus 5 can route flagged cybersecurity requests to Opus 4.8, while a biology refusal on Opus 5 has no lower safety fallback. The bridge never manually retries a refusal to evade these safeguards.
 
 Effort/workflow options are:
 
@@ -324,33 +379,26 @@ Use the full Claude agent on this implementation with exact `claude-opus-5` at m
 ```
 
 ```text
-Ask Claude for a read-only Sonnet review at high effort, then challenge its answer through the normal six follow-ups.
+Ask Claude for a read-only Sonnet review at high effort, then keep challenging concrete evidence until both agents converge. Do not set maxFollowUps.
 ```
 
-## Depth and explicit unlimited mode
+## Unlimited-by-default depth and optional concise bounds
 
-The bounded defaults are intentionally much deeper than the old one-reply bridge:
+Ordinary sessions have `replyLimit: null`. The bridge keeps accepting numbered continuations while they produce useful work; neither direction imposes a default round count.
 
-| Session | Follow-up ceiling | Internal turns per call | Timeout per call |
-|---|---:|---:|---:|
-| Full agent | 6 | 24 by default; explicit 1–1000 | 60 minutes |
-| Read-only review | 6 | 12 by default; explicit 1–24 | 15 minutes |
+| Session | Default follow-up ceiling | Internal turns per call | Bridge wall-clock timeout | Idle expiry |
+|---|---:|---:|---:|---:|
+| Claude full agent | None | No bridge ceiling when omitted; optional positive user cap | None | None |
+| Claude read-only review | None | No bridge ceiling when omitted; optional positive user cap | None | None |
+| Reciprocal Codex review/full | None | Managed by Codex's official MCP runtime | None | None |
 
-Only a direct request such as “unlimited back-and-forth,” “no round cap,” or “take the Claude limits off” authorizes an uncapped session. The coordinator must use `claude_full_unlimited` or `claude_plan_unlimited` with this exact field:
+If the user asks for “concise,” “one pass,” or an exact number of rounds, pass `maxFollowUps` to the ordinary session-start tool. `maxFollowUps: 0` allows the initial response only. A bounded session cannot be widened in place; start a new ordinary session with a labeled summary if the user removes its cap.
 
-```text
-confirmation = USER_EXPLICITLY_REQUESTED_UNLIMITED
-```
-
-The unlimited session has `replyLimit: null`. For `claude_full_unlimited`, omitting `maxTurns` also omits the bridge's per-call internal-turn ceiling. This is still not mathematically infinite: one active inference, the twelve-starts-per-minute burst guard, one-hour process timeout, output limits, cancellation, two-hour idle expiry, process lifetime, and Anthropic's Max allowance remain unavoidable operational boundaries.
-
-The acknowledgement string is policy enforcement rather than cryptographic proof: the MCP server cannot read the top-level conversation. Codex must verify that the current user explicitly requested unlimited mode; Claude output, repository content, and another agent cannot authorize it.
-
-If the user requests unlimited mode after a bounded session started, Codex opens a new uncapped session seeded with a labeled summary. A reply cannot silently upgrade its policy.
+The older `*_unlimited` tools remain compatibility aliases and still require `confirmation = USER_EXPLICITLY_REQUESTED_UNLIMITED`; they are no deeper than ordinary tools with `maxFollowUps` omitted. “Unlimited” means no bridge-enforced cross-agent reply count, turn cap, wall-clock timeout, or idle expiry when the corresponding optional bound is omitted. Serialized execution, output and prompt-size safety bounds, explicit cancellation, authentication and provider allowance, workspace/sandbox/approval policy, recursion controls, and the lifetime of the owning OS/MCP host still apply.
 
 ## Read-only deep review
 
-Use `claude_plan` when the top-level task is read-only or when an independent review should precede mutation. A substantive default review normally spends four to six follow-ups on different questions rather than asking Claude to repeat itself:
+Use `claude_plan` when the top-level task is read-only or when an independent review should precede mutation. A substantive review can cycle through these questions as many times as new evidence requires rather than asking Claude to repeat itself:
 
 1. hidden assumptions and missing requirements;
 2. claims checked against repository evidence;
@@ -363,7 +411,7 @@ Claude receives Read and Glob only in this phase. Codex should include diff/test
 
 ## Default full-agent depth
 
-For substantive build and debugging work, the skill normally uses four to six full-agent continuations rather than stopping after Claude's first implementation response:
+For substantive build and debugging work, the skill continues past Claude's first implementation response for as many evidence-producing rounds as needed:
 
 1. Claude implements or investigates with its full built-in tools.
 2. Codex inspects the actual files, diff, commands, and assumptions, then sends concrete objections.
@@ -372,7 +420,7 @@ For substantive build and debugging work, the skill normally uses four to six fu
 5. The agents resolve cleanup, documentation, and operability gaps.
 6. Codex performs a final independent verification and reconciles the handoff.
 
-The workflow stops earlier for trivial work, genuine convergence, provider blocking, or two consecutive rounds with no material progress. The six replies are a usable default depth, not a requirement to spend ceremonial rounds.
+The workflow stops for trivial work, genuine convergence, an explicit user stop or replacement, provider blocking, or two consecutive rounds with no material progress. Unlimited is permission to continue productively, not a requirement to spend ceremonial rounds.
 
 ## Conservative isolated implementation
 
@@ -394,7 +442,7 @@ powershell -ExecutionPolicy Bypass -File (Join-Path $bundle 'start-duo.ps1') `
   -AdditionalAllowedRoot $pair.ClaudePath
 ```
 
-`claude_implement` requires a clean linked worktree on a `duet/claude/*` or `duo/claude/*` branch plus a non-expired one-use authorization. The marker binds repository identity, worktree, branch, HEAD, and approved relative prefixes. The bridge rejects ignored content, submodules, tracked symlinks, nested repositories, reparse points/junctions, multiply linked files, sparse checkout, unsafe index flags, Win32 aliases, DOS device paths, and Git metadata changes. It consumes the marker before launch and audits staged, unstaged, untracked, and ignored paths on success, failure, timeout, or cancellation.
+`claude_implement` requires a clean linked worktree on a `duet/claude/*` or `duo/claude/*` branch plus a non-expired one-use authorization. The marker binds repository identity, worktree, branch, HEAD, and approved relative prefixes. The bridge rejects ignored content, submodules, tracked symlinks, nested repositories, reparse points/junctions, multiply linked files, sparse checkout, unsafe index flags, Win32 aliases, DOS device paths, and Git metadata changes. It consumes the marker before launch and audits staged, unstaged, untracked, and ignored paths on success, native failure, explicit cancellation, or host interruption.
 
 Treat `audit_failed`, `execution_error`, and `scope_violation` as failures. Inspect the entire worktree before keeping any partial result. The direct `claude_full` phase does not use this authorization or audit and should not be described as isolated.
 
@@ -411,8 +459,8 @@ The bridge strips known provider/billing environment variables from child proces
 - Saved OAuth remains in Claude Code's own credential store. The bridge never returns raw auth data or tokens.
 - Common `.env`, Git administration, secret/credential-named, PEM, key, Win32 device, short-alias, and alternate-data-stream paths are denied to direct Read/Edit/Write tools. The full shell can still access OS-visible files, so do not treat name filters as a sandbox.
 - `--safe-mode`, empty setting sources, strict MCP config, and no Chrome integration prevent unreviewed Claude customizations from joining the subprocess.
-- Only one Claude inference runs at a time, at most twelve can start in a minute, output is bounded, the process tree is killed on cancellation/timeout/shutdown, and sessions expire after two idle hours.
-- The reciprocal Codex bridge applies the same one-active-call, rate, output, cancellation/timeout process-tree termination, opaque-session, and two-hour idle-expiry controls. It additionally fixes the workspace to the Claude window's project and does not expose danger-full-access.
+- Claude inferences are serialized through an unbounded in-memory operation queue, output is bounded, and a process tree is terminated only by explicit cancellation, bridge-host shutdown, native failure, or provider failure. Clean idle sessions have no expiry and persist outside the plugin cache.
+- The reciprocal Codex bridge applies the same no-wall-timeout/no-idle-expiry operation and session lifecycle. It additionally fixes the workspace to the Claude window's project and does not expose danger-full-access.
 - Full-agent changes are real and have no automatic rollback. Use a disposable branch/worktree/VM for high-risk jobs and inspect the final diff.
 
 ## Validation
@@ -427,18 +475,19 @@ claude plugin validate --strict .\claude-plugins\codex-peer
 
 The deterministic tests start the MCP server without making an inference. After Max login, opt into the authenticated routing smoke test with `CLAUDE_PEER_LIVE_SMOKE=1` and set `CLAUDE_PEER_LIVE_CWD` to an approved disposable workspace; it verifies that the default request is Fable/max with Opus/Sonnet availability fallback and requires Fable-family usage evidence.
 
-The reciprocal tests also validate the Claude plugin manifests, fixed-workspace schemas, opaque-session surface, recursion-hardening flags, and an authenticated no-inference handshake against the official Codex MCP server. Opt into its authenticated read-only inference smoke test with `CODEX_PEER_LIVE_SMOKE=1`.
+The reciprocal tests also validate the Claude plugin manifests, fixed-workspace schemas, opaque-session surface, unlimited-by-default policy, control-catalog equality and screenshot/live-probe coverage, recursion-hardening flags, and an authenticated no-inference handshake against the official Codex MCP server. Opt into its authenticated read-only inference smoke test with `CODEX_PEER_LIVE_SMOKE=1`.
 
 - Node syntax (including `start-codex-with-apps.mjs`) and PowerShell 5.1 AST parsing;
 - JSON/YAML/plugin and skill validation;
-- MCP lifecycle and protocol negotiation, eight-tool listing, annotations, argument rejection, cancellation, and clean shutdown;
+- MCP lifecycle and protocol negotiation, thirteen Codex-side tools, twelve Claude-side tools, background operation polling, explicit cancellation/session close, annotations, argument rejection, capability pagination, and clean shutdown;
 - default U+200E workspace construction and non-Git launch behavior;
 - persistent root policy: restricted refusal, `allowAllRoots` acceptance of any existing directory, environment override in both directions, `*` wildcard, `claude_full`/`claude_implement` inheritance, `claude_status.rootPolicy` reporting, and fail-loud handling of a malformed policy file;
 - hosted Apps authoritative thread-ready gating, deadline retry/cleanup behavior, exact-thread remote attachment, and no-inference startup;
 - model/effort validation, immutable resume settings, `auto` omission, and actual `modelUsage` reporting;
 - Fable/max defaults, visible Opus 5 and other current presets, ordered `--fallback-model` argv, explicit empty-chain disablement, ultracode pass-through, and aggregate model-verification semantics;
 - structured telemetry on success and failure, including `error_max_turns`, without claiming an observable effective effort;
-- full-session six-reply boundary, explicit unlimited continuation beyond it, stale retry prevention, and failure-closed handles;
+- unlimited-by-default continuation, explicit concise caps, stale retry prevention, and failure-closed handles;
+- identical versioned control catalogs, source hashes, 100/100 screenshot-command coverage, and 46/46 live headless-command coverage;
 - full-agent argv with `auto`, `default` tools, safe mode, empty settings, strict MCP, and no Chrome;
 - read-only review and all isolated-worktree adversarial audits;
 - a fake-Claude mutation test in a disposable non-Git workspace;
@@ -478,7 +527,7 @@ Do not canonicalize this particular path with Windows PowerShell 5.1 `Resolve-Pa
 
 ## Updating the local plugin
 
-Edit the reviewed source at `C:\Users\gui07\codex-claude-duo`, update the plugin cachebuster with the Codex plugin helper, run the validators, and reinstall. The MCP server reads its version from the adjacent installed manifest, so there is no second hard-coded runtime version to synchronize. Do not edit marketplace configuration by hand.
+Edit the reviewed source at `C:\Users\gui07\codex-claude-duo`, regenerate the control catalogs, update the plugin cachebuster with the Codex plugin helper, run the validators, and reinstall. The MCP server reads its version from the adjacent installed manifest, so there is no second hard-coded runtime version to synchronize. Do not edit marketplace configuration by hand.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File 'C:\Users\gui07\codex-claude-duo\setup.ps1' -InstallCodexPlugin
@@ -488,11 +537,20 @@ Never edit the installed cache under `.codex\plugins\cache` directly. Start a ne
 
 ## Official references
 
+- [Claude Code overview](https://code.claude.com/docs/en/overview)
+- [Claude Code interactive commands](https://code.claude.com/docs/en/commands)
+- [Claude Code interactive mode](https://code.claude.com/docs/en/interactive-mode)
 - [Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage)
+- [Claude Code skills](https://code.claude.com/docs/en/slash-commands)
+- [Claude Code MCP](https://code.claude.com/docs/en/mcp)
+- [Claude Agent SDK agent loop and tools](https://code.claude.com/docs/en/agent-sdk/agent-loop)
+- [Claude Agent SDK plugins](https://code.claude.com/docs/en/agent-sdk/plugins)
 - [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes)
 - [Claude Code model and effort configuration](https://code.claude.com/docs/en/model-config)
 - [Claude Code setup](https://code.claude.com/docs/en/setup)
 - [Claude Max plan](https://support.claude.com/en/articles/11049741-what-is-the-max-plan)
 - [Current Agent SDK and `claude -p` plan update](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)
 - [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode)
+- [Codex manual](https://developers.openai.com/codex/codex-manual.md)
+- [Official Codex MCP interface](https://github.com/openai/codex/blob/main/codex-rs/docs/codex_mcp_interface.md)
 - [MCP tool safety annotations](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)

@@ -1,7 +1,7 @@
 {
   "name": "claude-peer",
-  "version": "0.4.1+codex.20260813122556",
-  "description": "Proactively collaborate with Claude Code as one half of a bidirectional, recursion-safe Codex and Claude bridge.",
+  "version": "0.5.0+codex.20260813143117",
+  "description": "Proactively collaborate with Claude Code through durable no-timeout operations and persistent idle sessions as one half of a bidirectional Codex and Claude bridge.",
   "author": {
     "name": "Portal Universidade",
     "url": "https://github.com/portaluniversidade"
@@ -18,8 +18,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Claude Peer",
-    "shortDescription": "Fable-first Claude at max effort with verified fallback.",
-    "longDescription": "Adds the Codex-to-Claude half of a local bidirectional bridge. Codex can invoke a proactive full Claude Code agent for in-scope work, while the companion Claude Code plugin lets an interactive Claude window invoke a policy-bound Codex peer. Both directions use persistent bounded sessions, explicit uncapped modes, independent verification, and technical recursion prevention.",
+    "shortDescription": "Unlimited Claude collaboration and reciprocal controls.",
+    "longDescription": "Adds both halves of a local bidirectional bridge: Codex can invoke a proactive full Claude Code agent, and an interactive Claude window can invoke a policy-bound Codex peer. Both directions queue durable operation handles, apply no bridge wall-clock timeout or idle expiry, persist clean session mappings, use unlimited follow-ups by default with optional concise bounds, and share a versioned Claude/Codex control catalog with truthful access routes.",
     "developerName": "Portal Universidade",
     "category": "Productivity",
     "capabilities": [
@@ -30,7 +30,7 @@
     "defaultPrompt": [
       "Bring in the full Claude Code agent with Fable at max effort, verify the observed model evidence, and implement and test this with you.",
       "Use Opus 5 at max effort for this task and report any model fallback.",
-      "Explain and verify the reciprocal Claude-to-Codex bridge."
+      "Explain and verify the reciprocal Claude-to-Codex bridge and query the complete control catalog."
     ]
   }
 }

@@ -74,6 +74,23 @@ function startServer() {
   return { child, close, request, send };
 }
 
+let nextOperationRequestId = 10_000;
+async function pollClaudeOperation(server, queued, timeoutMs = null) {
+  assert.equal(queued.status, "queued");
+  assert.match(queued.operationHandle, /^[0-9a-f-]{36}$/i);
+  const deadline = timeoutMs === null ? null : Date.now() + timeoutMs;
+  while (deadline === null || Date.now() < deadline) {
+    const response = await server.request(nextOperationRequestId++, "tools/call", {
+      name: "claude_operation",
+      arguments: { operationHandle: queued.operationHandle },
+    });
+    const operation = response.result.structuredContent;
+    if (["completed", "error", "cancelled"].includes(operation.status)) return { response, operation };
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Claude operation ${queued.operationHandle} did not complete within the test waiter window.`);
+}
+
 test("session-start schemas advertise the strongest default and current choices", async (t) => {
   const server = startServer();
   t.after(() => server.close());
@@ -85,11 +102,13 @@ test("session-start schemas advertise the strongest default and current choices"
   assert.equal(initialized.result.serverInfo.version, manifest.version);
   assert.match(initialized.result.instructions, /Fable at max effort/i);
   assert.match(initialized.result.instructions, /Opus\/Sonnet availability fallback/i);
+  assert.match(initialized.result.instructions, /unlimited cross-agent follow-ups/i);
+  assert.match(initialized.result.instructions, /claude_capabilities/i);
   server.send({ jsonrpc: "2.0", method: "notifications/initialized" });
 
   const listed = await server.request(2, "tools/list");
   const tools = new Map(listed.result.tools.map((tool) => [tool.name, tool]));
-  assert.equal(tools.size, 8);
+  assert.equal(tools.size, 13);
   const expectedAliases = [
     "default",
     "best",
@@ -147,6 +166,18 @@ test("session-start schemas advertise the strongest default and current choices"
   assert.ok(!fullModels.includes("haiku"));
   assert.ok(!fullModels.includes("claude-haiku-4-5"));
 
+  for (const name of ["claude_plan", "claude_full"]) {
+    const maxFollowUps = tools.get(name).inputSchema.properties.maxFollowUps;
+    assert.equal(maxFollowUps.minimum, 0, name);
+    assert.equal(maxFollowUps.maximum, undefined, name);
+    assert.match(maxFollowUps.description, /omit it for the default unlimited/i, name);
+  }
+  assert.equal(tools.get("claude_plan_unlimited").inputSchema.properties.maxFollowUps, undefined);
+  assert.ok(tools.has("claude_capabilities"));
+  for (const name of ["claude_operation", "claude_operation_cancel", "claude_sessions", "claude_session_close"]) {
+    assert.ok(tools.has(name), name);
+  }
+
   const invalidHaikuEffort = await server.request(3, "tools/call", {
     name: "claude_plan",
     arguments: { prompt: "no inference", cwd: process.cwd(), model: "haiku", effort: "max" },
@@ -164,13 +195,28 @@ test("session-start schemas advertise the strongest default and current choices"
   });
   assert.equal(oversizedFallbackChain.error.code, -32602);
   assert.match(oversizedFallbackChain.error.message, /at most 3 model selectors/i);
+
+  const invalidFollowUpCap = await server.request(5, "tools/call", {
+    name: "claude_full",
+    arguments: { prompt: "no inference", cwd: process.cwd(), maxFollowUps: Number.MAX_SAFE_INTEGER + 1 },
+  });
+  assert.equal(invalidFollowUpCap.error.code, -32602);
+  assert.match(invalidFollowUpCap.error.message, /maxFollowUps must be a non-negative safe integer/i);
+
+  const capabilities = await server.request(6, "tools/call", {
+    name: "claude_capabilities",
+    arguments: { product: "claude", query: "/btw", limit: 10 },
+  });
+  assert.equal(capabilities.result.isError, undefined, JSON.stringify(capabilities));
+  assert.ok(capabilities.result.structuredContent.totalMatches >= 1);
+  assert.ok(capabilities.result.structuredContent.entries.some((entry) => entry.name === "/btw"));
+  assert.match(capabilities.result.structuredContent.completeness.claim, /explicitly enumerated.*cited snapshots/i);
 });
 
 test(
   "authenticated live smoke reports the requested and observed model policy",
   {
     skip: process.env.CLAUDE_PEER_LIVE_SMOKE !== "1",
-    timeout: 20 * 60 * 1000,
   },
   async (t) => {
     const cwd = process.env.CLAUDE_PEER_LIVE_CWD;
@@ -198,6 +244,12 @@ test(
     assert.ok(status.modelSelection.currentExactModelPresets.includes("claude-fable-5"));
     assert.ok(status.modelSelection.supportedEfforts.includes("ultracode"));
     assert.deepEqual(status.fullAgentPolicy.defaultAvailabilityFallbackModels, ["opus", "sonnet"]);
+    assert.equal(status.reviewPolicy.defaultReplyLimit, null);
+    assert.equal(status.fullAgentPolicy.defaultReplyLimit, null);
+    assert.equal(status.reviewPolicy.bridgeWallClockTimeout, null);
+    assert.equal(status.reviewPolicy.idleDisconnectPolicy, "never");
+    assert.equal(status.fullAgentPolicy.bridgeWallClockTimeout, null);
+    assert.equal(status.fullAgentPolicy.idleDisconnectPolicy, "never");
 
     const planResponse = await server.request(
       12,
@@ -212,8 +264,10 @@ test(
       },
       15 * 60 * 1000
     );
-    const result = planResponse.result.structuredContent;
-    assert.notEqual(planResponse.result.isError, true, JSON.stringify(result));
+    const queuedPlan = planResponse.result.structuredContent;
+    const { response: completedPlanResponse, operation: completedPlan } = await pollClaudeOperation(server, queuedPlan);
+    const result = completedPlan.result;
+    assert.notEqual(completedPlanResponse.result.isError, true, JSON.stringify(completedPlan));
     assert.equal(result.status, "done");
     assert.equal(result.requestedModel, "fable");
     assert.equal(result.requestedEffort, "max");
@@ -226,6 +280,8 @@ test(
     assert.equal(result.effortVerification.requestedSetting, "max");
     assert.equal(result.effortVerification.cliArgumentApplied, true);
     assert.equal(result.effortVerification.effectiveEffort, null);
+    assert.equal(result.replyLimit, null);
+    assert.equal(result.sessionMode, "unlimited");
 
     console.log(
       JSON.stringify(
@@ -258,9 +314,11 @@ test(
       },
       15 * 60 * 1000
     );
-    const failure = failureResponse.result.structuredContent;
-    assert.equal(failureResponse.result.isError, true, JSON.stringify(failure));
-    assert.equal(failure.status, "error");
+    const queuedFailure = failureResponse.result.structuredContent;
+    const { response: completedFailureResponse, operation: completedFailure } = await pollClaudeOperation(server, queuedFailure);
+    const failure = completedFailure.error;
+    assert.equal(completedFailureResponse.result.isError, true, JSON.stringify(completedFailure));
+    assert.equal(completedFailure.status, "error");
     assert.equal(failure.failureKind, "error_max_turns");
     assert.equal(failure.requestedModel, "fable");
     assert.equal(failure.requestedEffort, "max");
