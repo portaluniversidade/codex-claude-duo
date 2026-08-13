@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,27 +15,32 @@ const MAX_PROMPT_CHARS = 60_000;
 const MAX_CONTENT_CHARS = 80_000;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_STDERR_BYTES = 512 * 1024;
-const MAX_INFERENCES_PER_MINUTE = 12;
-const SESSION_IDLE_TTL_MS = 2 * 60 * 60 * 1000;
-const DEFAULT_REPLY_LIMIT = 6;
-const MAX_SESSIONS = 50;
 const UNLIMITED_CONFIRMATION = "USER_EXPLICITLY_REQUESTED_UNLIMITED";
-const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max", "ultra"]);
+const CONTROL_CATALOG_PATH = fileURLToPath(new URL("../assets/control-catalog.json", import.meta.url));
+const EFFORT_LEVELS = new Set(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const PHASES = Object.freeze({
-  review: { sandbox: "read-only", timeoutMs: 15 * 60 * 1000 },
-  full: { sandbox: "workspace-write", timeoutMs: 60 * 60 * 1000 },
+  review: { sandbox: "read-only" },
+  full: { sandbox: "workspace-write" },
 });
 
 const sessions = new Map();
-const inferenceStarts = [];
+const operations = new Map();
 const requestOperations = new Map();
 let activeOperation = null;
 let childClient = null;
 let lifecycle = "new";
 let stdoutBroken = false;
 let cachedCodexBinary;
+let sessionPersistenceError = null;
+let operationQueueTail = Promise.resolve();
 
 const WORKSPACE_ROOT = resolveWorkspaceRoot();
+const STATE_ROOT = path.resolve(
+  process.env.CODEX_PEER_STATE_DIR ||
+  path.join(process.env.LOCALAPPDATA || path.join(homedir(), ".local", "state"), "codex-claude-duo")
+);
+const WORKSPACE_STATE_KEY = createHash("sha256").update(WORKSPACE_ROOT).digest("hex").slice(0, 24);
+const SESSION_STATE_PATH = path.join(STATE_ROOT, `codex-peer-sessions-${WORKSPACE_STATE_KEY}.json`);
 
 const BASE_DEVELOPER_INSTRUCTIONS = [
   "You are Codex acting as a policy-bound peer to Claude Code for one user's local task.",
@@ -132,6 +137,68 @@ function requireUnlimitedConfirmation(args, toolName) {
   if (args?.confirmation !== UNLIMITED_CONFIRMATION) {
     throw new Error(`${toolName} requires confirmation=${UNLIMITED_CONFIRMATION} after an explicit user request.`);
   }
+}
+
+function selectedReplyLimit(args, forceUnlimited = false) {
+  if (forceUnlimited || args.maxFollowUps === undefined) return null;
+  if (!Number.isSafeInteger(args.maxFollowUps) || args.maxFollowUps < 0) {
+    throw new Error("maxFollowUps must be a non-negative safe integer.");
+  }
+  return args.maxFollowUps;
+}
+
+function readControlCatalog() {
+  const raw = readFileSync(CONTROL_CATALOG_PATH, "utf8");
+  if (Buffer.byteLength(raw, "utf8") > MAX_RESPONSE_BYTES) throw new Error("The control catalog exceeds the 2 MiB safety limit.");
+  const catalog = JSON.parse(raw);
+  if (!Array.isArray(catalog.entries)) throw new Error("The control catalog is malformed: entries must be an array.");
+  return catalog;
+}
+
+function codexCapabilities(args) {
+  const catalog = readControlCatalog();
+  const product = args.product ?? "all";
+  const surface = args.surface?.toLowerCase() ?? null;
+  const access = args.access?.toLowerCase() ?? null;
+  const query = args.query?.trim().toLowerCase() ?? "";
+  const offset = args.offset ?? 0;
+  const limit = args.limit ?? 25;
+  const filtered = catalog.entries.filter((entry) => {
+    if (product !== "all" && entry.product !== product) return false;
+    if (surface && String(entry.surface).toLowerCase() !== surface) return false;
+    if (access && String(entry.access).toLowerCase() !== access) return false;
+    if (query) {
+      const haystack = JSON.stringify([entry.name, entry.aliases, entry.syntax, entry.purpose, entry.route]).toLowerCase();
+      if (!haystack.includes(query)) return false;
+    }
+    return true;
+  });
+  const page = filtered.slice(offset, offset + limit);
+  const nextOffset = offset + page.length < filtered.length ? offset + page.length : null;
+  const response = {
+    status: "ready",
+    catalogSchemaVersion: catalog.schemaVersion,
+    generatedAt: catalog.generatedAt,
+    completeness: catalog.completeness,
+    coverage: catalog.coverage,
+    sourceSnapshots: catalog.sourceSnapshots,
+    accessLegend: catalog.accessLegend,
+    sources: catalog.sources,
+    ...(args.includeRuntime === false ? {} : { runtimeObservations: catalog.runtimeObservations }),
+    filters: { product, surface, access, query },
+    totalMatches: filtered.length,
+    offset,
+    returned: page.length,
+    nextOffset,
+    entries: page,
+  };
+  return {
+    ...response,
+    content:
+      `Control catalog page: ${page.length} of ${filtered.length} matching entries at offset ${offset}. ` +
+      `nextOffset=${nextOffset === null ? "none" : nextOffset}. Access labels are authoritative; known UI commands are not automatically remote tools.\n` +
+      JSON.stringify(page, null, 2),
+  };
 }
 
 function buildChildEnvironment() {
@@ -292,7 +359,7 @@ class CodexMcpClient {
       const waiter = this.pending.get(String(message.id));
       if (!waiter) return;
       this.pending.delete(String(message.id));
-      clearTimeout(waiter.timer);
+      if (waiter.timer) clearTimeout(waiter.timer);
       if (message.error) waiter.reject(new Error(`Codex MCP error ${message.error.code}: ${message.error.message}`));
       else waiter.resolve(message.result);
       return;
@@ -310,15 +377,17 @@ class CodexMcpClient {
   request(method, params = {}, timeoutMs = 30_000) {
     const id = String(this.nextId++);
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`${method} did not respond within ${Math.round(timeoutMs / 1000)} seconds.`));
-      }, timeoutMs);
+      const timer = timeoutMs === null
+        ? null
+        : setTimeout(() => {
+            this.pending.delete(id);
+            reject(new Error(`${method} did not respond within ${Math.round(timeoutMs / 1000)} seconds.`));
+          }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       try {
         this.write({ jsonrpc: "2.0", id, method, params });
       } catch (error) {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         this.pending.delete(id);
         reject(error);
       }
@@ -331,7 +400,7 @@ class CodexMcpClient {
 
   failAll(error) {
     for (const waiter of this.pending.values()) {
-      clearTimeout(waiter.timer);
+      if (waiter.timer) clearTimeout(waiter.timer);
       waiter.reject(error);
     }
     this.pending.clear();
@@ -344,18 +413,21 @@ class CodexMcpClient {
   }
 }
 
-function clearClientAndSessions(reason) {
+function resetClient(reason) {
   if (childClient) childClient.stop(reason);
   childClient = null;
-  sessions.clear();
 }
 
-async function ensureClient() {
-  if (childClient?.ready && childClient.child?.exitCode === null) return childClient;
+async function ensureClient(onClientAvailable) {
+  if (childClient?.ready && childClient.child?.exitCode === null) {
+    onClientAvailable?.(childClient);
+    return childClient;
+  }
   const auth = codexAuthStatus(resolveCodexBinary());
   if (!auth.authenticated) throw new Error(`Codex ChatGPT authentication is required. ${auth.output}`);
   const client = new CodexMcpClient(resolveCodexBinary());
   try {
+    onClientAvailable?.(client);
     await client.start();
   } catch (error) {
     client.stop(error);
@@ -365,42 +437,58 @@ async function ensureClient() {
   return client;
 }
 
-function enforceInferenceLimit() {
-  if (activeOperation) throw new Error("Another Codex inference is already active; concurrent calls are refused.");
-  const cutoff = Date.now() - 60_000;
-  while (inferenceStarts.length && inferenceStarts[0] < cutoff) inferenceStarts.shift();
-  if (inferenceStarts.length >= MAX_INFERENCES_PER_MINUTE) {
-    throw new Error(`Rate limit reached: at most ${MAX_INFERENCES_PER_MINUTE} Codex inferences may start per minute.`);
-  }
-  inferenceStarts.push(Date.now());
+function enforceSerialInferenceInvariant() {
+  if (activeOperation) throw new Error("Internal queue invariant failed: another Codex inference is already active.");
 }
 
 async function callCodexTool(name, args, phase, operationId, progressToken) {
-  enforceInferenceLimit();
-  const client = await ensureClient();
-  const startedAt = Date.now();
-  activeOperation = { operationId, client };
-  const progressTimer = progressToken === undefined ? null : setInterval(() => {
-    send({
-      jsonrpc: "2.0",
-      method: "notifications/progress",
-      params: {
-        progressToken,
-        progress: Math.min(0.95, (Date.now() - startedAt) / phase.timeoutMs),
-        total: 1,
-        message: "Codex peer is still working.",
-      },
-    });
-  }, 30_000);
+  enforceSerialInferenceInvariant();
+  let client = null;
+  let cancellationError = null;
+  let inferenceStarted = false;
+  let progressTimer = null;
+  activeOperation = {
+    operationId,
+    cancel: (error) => {
+      cancellationError = error instanceof Error ? error : new Error(String(error));
+      if (client && (!client.ready || inferenceStarted)) {
+        if (childClient === client) resetClient(cancellationError);
+        else client.stop(cancellationError);
+      }
+    },
+  };
   try {
-    const result = await client.request("tools/call", { name, arguments: args }, phase.timeoutMs);
+    client = await ensureClient((availableClient) => {
+      client = availableClient;
+      if (cancellationError) throw cancellationError;
+    });
+    if (cancellationError || operations.get(operationId)?.cancelRequested) {
+      throw cancellationError || new Error("Codex operation was explicitly cancelled through codex_operation_cancel.");
+    }
+    const startedAt = Date.now();
+    progressTimer = progressToken === undefined ? null : setInterval(() => {
+      send({
+        jsonrpc: "2.0",
+        method: "notifications/progress",
+        params: {
+          progressToken,
+          progress: Math.floor((Date.now() - startedAt) / 1000),
+          message: "Codex peer is still working; no bridge wall-clock timeout is running.",
+        },
+      });
+    }, 30_000);
+    inferenceStarted = true;
+    const result = await client.request("tools/call", { name, arguments: args }, null);
     if (Buffer.byteLength(JSON.stringify(result), "utf8") > MAX_RESPONSE_BYTES) {
       throw new Error("Codex MCP response exceeded the 2 MiB safety limit.");
     }
     return { result, durationMs: Date.now() - startedAt };
   } catch (error) {
-    clearClientAndSessions(error);
-    throw error;
+    const wrapped = error instanceof Error ? error : new Error(String(error));
+    if (wrapped.inferenceStarted === undefined) wrapped.inferenceStarted = inferenceStarted;
+    if (inferenceStarted && childClient === client) resetClient(wrapped);
+    else if (inferenceStarted && client) client.stop(wrapped);
+    throw wrapped;
   } finally {
     if (progressTimer) clearInterval(progressTimer);
     activeOperation = null;
@@ -426,13 +514,81 @@ function parseCodexToolResult(result) {
   throw new Error(`Codex MCP response did not contain threadId and content. ${redact(text, 2000)}`);
 }
 
-function purgeSessions() {
-  const cutoff = Date.now() - SESSION_IDLE_TTL_MS;
-  for (const [handle, session] of sessions) if (session.lastActivityAt < cutoff) sessions.delete(handle);
+function isSafeThreadId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9._:-]{8,160}$/.test(value);
+}
+
+function isPersistableSession(handle, session) {
+  return /^[0-9a-fA-F-]{36}$/.test(handle) &&
+    ["review", "full"].includes(session?.kind) &&
+    ["unlimited", "bounded"].includes(session?.mode) &&
+    isSafeThreadId(session?.threadId) &&
+    (session?.model === null || typeof session?.model === "string") &&
+    (session?.effort === null || EFFORT_LEVELS.has(session?.effort)) &&
+    (session?.replyLimit === null || (Number.isSafeInteger(session.replyLimit) && session.replyLimit >= 0)) &&
+    Number.isSafeInteger(session?.replies) && session.replies >= 0 &&
+    typeof session?.inFlight === "boolean" &&
+    Number.isFinite(session?.createdAt) && Number.isFinite(session?.lastActivityAt);
+}
+
+function persistSessions() {
+  try {
+    mkdirSync(STATE_ROOT, { recursive: true });
+    const payload = {
+      schemaVersion: 1,
+      workspace: WORKSPACE_ROOT,
+      updatedAt: new Date().toISOString(),
+      sessions: [...sessions.entries()].map(([handle, session]) => ({
+        handle,
+        kind: session.kind,
+        mode: session.mode,
+        threadId: session.threadId,
+        model: session.model,
+        effort: session.effort,
+        replyLimit: session.replyLimit,
+        replies: session.replies,
+        inFlight: session.inFlight,
+        createdAt: session.createdAt,
+        lastActivityAt: session.lastActivityAt,
+      })),
+    };
+    const temporary = `${SESSION_STATE_PATH}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(temporary, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    try {
+      renameSync(temporary, SESSION_STATE_PATH);
+    } catch {
+      if (existsSync(SESSION_STATE_PATH)) unlinkSync(SESSION_STATE_PATH);
+      renameSync(temporary, SESSION_STATE_PATH);
+    }
+    sessionPersistenceError = null;
+  } catch (error) {
+    sessionPersistenceError = redact(error?.message || error, 2000);
+  }
+}
+
+function loadPersistedSessions() {
+  if (!existsSync(SESSION_STATE_PATH)) return;
+  try {
+    const payload = JSON.parse(readFileSync(SESSION_STATE_PATH, "utf8"));
+    if (payload?.schemaVersion !== 1 || payload.workspace !== WORKSPACE_ROOT || !Array.isArray(payload.sessions)) {
+      throw new Error("Unsupported, mismatched, or malformed session-state file.");
+    }
+    let droppedAmbiguous = false;
+    for (const entry of payload.sessions) {
+      const { handle, ...persisted } = entry || {};
+      const session = { ...persisted, inFlight: persisted?.inFlight === true, phase: PHASES[persisted?.kind] };
+      if (isPersistableSession(handle, session) && !session.inFlight) sessions.set(handle, session);
+      else if (session.inFlight === true) droppedAmbiguous = true;
+    }
+    sessionPersistenceError = null;
+    if (droppedAmbiguous) persistSessions();
+  } catch (error) {
+    sessionPersistenceError = redact(error?.message || error, 2000);
+  }
 }
 
 function sessionPolicy(session) {
-  const canReply = session.replyLimit === null || session.replies < session.replyLimit;
+  const canReply = !session.inFlight && (session.replyLimit === null || session.replies < session.replyLimit);
   return {
     sessionMode: session.mode,
     sessionKind: session.kind,
@@ -441,8 +597,11 @@ function sessionPolicy(session) {
     repliesRemaining: session.replyLimit === null ? null : Math.max(0, session.replyLimit - session.replies),
     canReply,
     nextReplyNumber: canReply ? session.replies + 1 : null,
-    sessionState: canReply ? "open" : "exhausted",
-    idleExpiresAt: new Date(session.lastActivityAt + SESSION_IDLE_TTL_MS).toISOString(),
+    sessionState: session.inFlight ? "busy" : canReply ? "open" : "exhausted",
+    idleExpiresAt: null,
+    idleDisconnectPolicy: "never",
+    explicitCloseRequired: true,
+    persistedAcrossBridgeRestarts: sessionPersistenceError === null,
   };
 }
 
@@ -463,11 +622,24 @@ function invocationMetadata(session, durationMs) {
   };
 }
 
-function newToolArguments(prompt, kind, model, effort) {
+function fullAgentFailure(error, detail) {
+  const message = redact(error?.message || error, 8000);
+  const wrapped = new Error(
+    `${message} ${detail} The full agent may already have changed files or produced command side effects. ` +
+    "No automatic rollback was performed; inspect the workspace diff, files, tests, and any relevant external state before retrying."
+  );
+  wrapped.workspaceMayContainPartialChanges = true;
+  return wrapped;
+}
+
+function newToolArguments(prompt, kind, model, effort, replyLimit) {
   const phase = PHASES[kind];
   const phaseInstruction = kind === "review"
     ? "This phase is read-only. Do not modify files or external state."
     : "This phase may make user-authorized local changes only inside the bound workspace. Network access is disabled. Report every changed file and verification command.";
+  const collaborationInstruction = replyLimit === null
+    ? "Cross-agent follow-ups have no numerical bridge ceiling by default. Continue productively until the task converges or the user stops it; do not spend ceremonial turns after convergence."
+    : `The user requested concise or bounded collaboration with at most ${replyLimit} follow-up${replyLimit === 1 ? "" : "s"} after this response. Prioritize the strongest unresolved issue.`;
   const config = {};
   if (effort) config.model_reasoning_effort = effort;
   return {
@@ -475,15 +647,13 @@ function newToolArguments(prompt, kind, model, effort) {
     cwd: WORKSPACE_ROOT,
     sandbox: phase.sandbox,
     "approval-policy": "never",
-    "developer-instructions": `${BASE_DEVELOPER_INSTRUCTIONS} ${phaseInstruction}`,
+    "developer-instructions": `${BASE_DEVELOPER_INSTRUCTIONS} ${phaseInstruction} ${collaborationInstruction}`,
     ...(model ? { model } : {}),
     ...(Object.keys(config).length ? { config } : {}),
   };
 }
 
-async function startSession(args, kind, mode, operationId, progressToken) {
-  purgeSessions();
-  if (sessions.size >= MAX_SESSIONS) throw new Error(`The bridge already holds ${MAX_SESSIONS} active sessions.`);
+async function startSession(args, kind, forceUnlimited, operationId, progressToken) {
   if (kind === "full") {
     const sandbox = codexSandboxStatus(resolveCodexBinary());
     if (!sandbox.ready) {
@@ -493,10 +663,22 @@ async function startSession(args, kind, mode, operationId, progressToken) {
   const prompt = requireString(args, "prompt");
   const model = optionalModel(args);
   const effort = optionalEffort(args);
+  const replyLimit = selectedReplyLimit(args, forceUnlimited);
+  const mode = replyLimit === null ? "unlimited" : "bounded";
   const phase = PHASES[kind];
-  const { result, durationMs } = await callCodexTool("codex", newToolArguments(prompt, kind, model, effort), phase, operationId, progressToken);
-  const parsed = parseCodexToolResult(result);
-  if (!/^[A-Za-z0-9._:-]{8,160}$/.test(parsed.threadId)) throw new Error("Codex returned an unsafe thread identifier.");
+  let result;
+  let durationMs;
+  let parsed;
+  try {
+    ({ result, durationMs } = await callCodexTool("codex", newToolArguments(prompt, kind, model, effort, replyLimit), phase, operationId, progressToken));
+    parsed = parseCodexToolResult(result);
+    if (!isSafeThreadId(parsed.threadId)) throw new Error("Codex returned an unsafe thread identifier.");
+  } catch (error) {
+    if (kind === "full" && error?.inferenceStarted !== false) {
+      throw fullAgentFailure(error, "The initial full-agent call did not complete cleanly.");
+    }
+    throw error;
+  }
   const handle = randomUUID();
   const now = Date.now();
   const session = {
@@ -506,12 +688,14 @@ async function startSession(args, kind, mode, operationId, progressToken) {
     model,
     effort,
     phase,
-    replyLimit: mode === "unlimited" ? null : DEFAULT_REPLY_LIMIT,
+    replyLimit,
     replies: 0,
+    inFlight: false,
     createdAt: now,
     lastActivityAt: now,
   };
   sessions.set(handle, session);
+  persistSessions();
   return {
     status: "done",
     sessionHandle: handle,
@@ -522,10 +706,9 @@ async function startSession(args, kind, mode, operationId, progressToken) {
 }
 
 async function continueSession(args, expectedKind, operationId, progressToken) {
-  purgeSessions();
   const handle = requireString(args, "sessionHandle", 64);
   const session = sessions.get(handle);
-  if (!session) throw new Error("sessionHandle is unknown or expired; start a new Codex session.");
+  if (!session) throw new Error("sessionHandle is unknown or closed; start a new Codex session.");
   if (session.kind !== expectedKind) {
     throw new Error(`This handle belongs to a ${session.kind} session; use the matching reply tool.`);
   }
@@ -538,6 +721,8 @@ async function continueSession(args, expectedKind, operationId, progressToken) {
   }
   const prompt = requireString(args, "prompt");
   session.lastActivityAt = Date.now();
+  session.inFlight = true;
+  persistSessions();
   try {
     const { result, durationMs } = await callCodexTool("codex-reply", {
       threadId: session.threadId,
@@ -547,6 +732,8 @@ async function continueSession(args, expectedKind, operationId, progressToken) {
     if (parsed.threadId !== session.threadId) throw new Error("Codex continuation returned a different thread identifier.");
     session.replies = nextReply;
     session.lastActivityAt = Date.now();
+    session.inFlight = false;
+    persistSessions();
     return {
       status: "done",
       sessionHandle: handle,
@@ -556,9 +743,11 @@ async function continueSession(args, expectedKind, operationId, progressToken) {
     };
   } catch (error) {
     sessions.delete(handle);
-    const wrapped = new Error(`${error.message} The session was closed because its continuation state is ambiguous.`);
-    if (expectedKind === "full") wrapped.workspaceMayContainPartialChanges = true;
-    throw wrapped;
+    persistSessions();
+    if (expectedKind === "full" && error?.inferenceStarted !== false) {
+      throw fullAgentFailure(error, "The full Codex session was closed because its continuation state is now ambiguous.");
+    }
+    throw new Error(`${error.message} The session was closed because its continuation state is ambiguous.`);
   }
 }
 
@@ -590,16 +779,31 @@ async function codexStatus() {
     workspaceBinding: "fixed_at_claude_mcp_startup",
     mcpSurfaceReady: surfaceReady,
     mcpSurfaceError: surfaceError,
-    tools: ["codex_plan", "codex_plan_unlimited", "codex_reply", "codex_full", "codex_full_unlimited", "codex_full_reply", "codex_status"],
+    tools: TOOL_DEFINITIONS.map((tool) => tool.name),
+    collaborationPolicy: {
+      defaultReplyLimit: null,
+      defaultMode: "unlimited",
+      conciseModeAvailableWithMaxFollowUps: true,
+      bridgeWallClockTimeout: null,
+      idleTimeout: null,
+      idleDisconnectPolicy: "never",
+      operationPollingTool: "codex_operation",
+      explicitCancellationTool: "codex_operation_cancel",
+      explicitSessionCloseTool: "codex_session_close",
+      sessionsPersistAcrossBridgeRestarts: sessionPersistenceError === null,
+      sessionPersistenceError,
+    },
     recursionPrevention: {
+      scope: "nested MCP, plugin, app, and hook routes",
       pluginsDisabled: true,
       appsDisabled: true,
       hooksDisabled: true,
       configuredMcpServersCleared: true,
       developerInstructionApplied: true,
+      shellLaunchProhibitedByInstructionOnly: true,
     },
     content: ready
-      ? `Codex ${redact(version.stdout || "", 200).trim()} is authenticated with ChatGPT and ready as a reciprocal peer in ${WORKSPACE_ROOT}. Workspace-write sandbox probe: ${sandbox.ready ? "ready" : sandbox.output}.`
+      ? `Codex ${redact(version.stdout || "", 200).trim()} is authenticated with ChatGPT and ready as a reciprocal peer in ${WORKSPACE_ROOT}. Follow-ups are unlimited by default; active work has no bridge wall-clock timeout and idle sessions never expire. Workspace-write sandbox probe: ${sandbox.ready ? "ready" : sandbox.output}.`
       : auth.authenticated
         ? `Codex is authenticated, but its MCP surface is unavailable: ${surfaceError}`
         : `Codex ChatGPT login is required. ${auth.output}`,
@@ -611,7 +815,12 @@ function modelSchema() {
 }
 
 function effortSchema() {
-  return { type: "string", enum: [...EFFORT_LEVELS], description: "Optional Codex reasoning-effort override. Omit it to use the configured default." };
+  return {
+    type: "string",
+    enum: [...EFFORT_LEVELS],
+    description:
+      "Optional Codex reasoning-effort override. This is the documented/observed union (minimal, low, medium, high, xhigh, max, ultra); effective support depends on the selected model and Codex runtime. Omit it to use the configured default.",
+  };
 }
 
 function startSchema(unlimited = false) {
@@ -622,9 +831,32 @@ function startSchema(unlimited = false) {
       prompt: { type: "string", minLength: 1, maxLength: MAX_PROMPT_CHARS },
       model: modelSchema(),
       effort: effortSchema(),
+      ...(!unlimited ? {
+        maxFollowUps: {
+          type: "integer",
+          minimum: 0,
+          description: "Optional follow-up cap. Omit it for unlimited back-and-forth; set it only when the user asks for concise, bounded, or an exact number of rounds.",
+        },
+      } : {}),
       ...(unlimited ? { confirmation: { const: UNLIMITED_CONFIRMATION } } : {}),
     },
     required: unlimited ? ["prompt", "confirmation"] : ["prompt"],
+  };
+}
+
+function capabilitySchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      product: { type: "string", enum: ["all", "claude", "codex"], default: "all" },
+      surface: { type: "string", minLength: 1, maxLength: 80 },
+      access: { type: "string", minLength: 1, maxLength: 80 },
+      query: { type: "string", maxLength: 200 },
+      offset: { type: "integer", minimum: 0, default: 0 },
+      limit: { type: "integer", minimum: 1, maximum: 50, default: 25 },
+      includeRuntime: { type: "boolean", default: true },
+    },
   };
 }
 
@@ -633,7 +865,7 @@ function replySchema() {
     type: "object",
     additionalProperties: false,
     properties: {
-      sessionHandle: { type: "string", minLength: 1, maxLength: 64 },
+      sessionHandle: opaqueHandleSchema("Opaque persistent Codex session handle."),
       expectedReplyNumber: { type: "integer", minimum: 1 },
       prompt: { type: "string", minLength: 1, maxLength: MAX_PROMPT_CHARS },
     },
@@ -641,29 +873,320 @@ function replySchema() {
   };
 }
 
+function opaqueHandleSchema(description) {
+  return { type: "string", pattern: "^[0-9a-fA-F-]{36}$", description };
+}
+
 const TOOL_DEFINITIONS = [
-  { name: "codex_plan", title: "Ask Codex for read-only review", description: `Start a persistent read-only Codex peer in the Claude window's fixed project root. The initial response permits ${DEFAULT_REPLY_LIMIT} follow-ups.`, inputSchema: startSchema(false) },
-  { name: "codex_plan_unlimited", title: "Start uncapped Codex review", description: "Start a read-only Codex peer with no numerical reply ceiling. Requires explicit top-level user consent.", inputSchema: startSchema(true) },
-  { name: "codex_reply", title: "Continue Codex review", description: "Continue an opaque read-only Codex session with replay-protected reply numbering.", inputSchema: replySchema() },
-  { name: "codex_full", title: "Run Codex in workspace-write", description: `Start a persistent Codex peer with workspace-write access, network disabled, and ${DEFAULT_REPLY_LIMIT} follow-ups. Use only for user-authorized local changes.`, inputSchema: startSchema(false) },
-  { name: "codex_full_unlimited", title: "Start uncapped Codex workspace session", description: "Start a workspace-write Codex peer with no numerical reply ceiling. Requires explicit top-level user consent.", inputSchema: startSchema(true) },
-  { name: "codex_full_reply", title: "Continue Codex workspace session", description: "Continue an opaque workspace-write Codex session with replay-protected reply numbering.", inputSchema: replySchema() },
+  { name: "codex_plan", title: "Ask Codex for read-only review", description: "Queue a persistent read-only Codex peer with unlimited follow-ups by default in the Claude window's fixed project root. Returns an operation handle immediately; poll codex_operation.", inputSchema: startSchema(false) },
+  { name: "codex_plan_unlimited", title: "Start uncapped Codex review (compatibility alias)", description: "Compatibility alias that queues an uncapped read-only session and returns an operation handle. Ordinary codex_plan sessions are already unlimited by default.", inputSchema: startSchema(true) },
+  { name: "codex_reply", title: "Continue Codex review", description: "Queue a continuation of an opaque read-only Codex session and return an operation handle. Sessions never expire for idleness and are unlimited unless maxFollowUps was deliberately set.", inputSchema: replySchema() },
+  { name: "codex_full", title: "Run Codex in workspace-write", description: "Queue a persistent Codex peer with workspace-write access, network disabled, and unlimited follow-ups by default. Returns an operation handle; use only for user-authorized local changes.", inputSchema: startSchema(false) },
+  { name: "codex_full_unlimited", title: "Start uncapped Codex workspace session (compatibility alias)", description: "Compatibility alias that queues an uncapped workspace-write session and returns an operation handle. Ordinary codex_full sessions are already unlimited by default.", inputSchema: startSchema(true) },
+  { name: "codex_full_reply", title: "Continue Codex workspace session", description: "Queue a continuation of an opaque workspace-write Codex session and return an operation handle. Sessions never expire for idleness and are unlimited unless maxFollowUps was deliberately set.", inputSchema: replySchema() },
   { name: "codex_status", title: "Check reciprocal Codex bridge", description: "Check the standalone Codex CLI, ChatGPT login, fixed workspace, official MCP surface, and recursion controls without starting an inference.", inputSchema: { type: "object", additionalProperties: false, properties: {} } },
+  { name: "codex_capabilities", title: "Query Claude and Codex controls", description: "Query the versioned catalog of Claude/Codex commands, CLI options, agent tools, bridge tools, shortcuts, deep links, and truthful access routes. Use pagination to inspect every entry.", inputSchema: capabilitySchema() },
+  { name: "codex_operation", title: "Inspect Codex operation", description: "List background Codex operations or retrieve one completed/running result. Long work has no bridge wall-clock timeout and remains retrievable after a client waiter detaches.", inputSchema: { type: "object", additionalProperties: false, properties: { operationHandle: opaqueHandleSchema("Optional operation handle. Omit it to list operations.") } } },
+  { name: "codex_operation_cancel", title: "Cancel Codex operation", description: "Explicitly cancel one queued or running Codex operation. Cancellation does not expire unrelated idle sessions.", inputSchema: { type: "object", additionalProperties: false, properties: { operationHandle: opaqueHandleSchema("Operation handle to cancel.") }, required: ["operationHandle"] } },
+  { name: "codex_sessions", title: "List Codex peer sessions", description: "List persistent opaque Codex sessions. Idle sessions do not expire and raw Codex thread IDs are never returned.", inputSchema: { type: "object", additionalProperties: false, properties: {} } },
+  { name: "codex_session_close", title: "Close Codex peer session", description: "Explicitly close one idle bridge session handle. This is the normal way to disconnect a Codex peer session.", inputSchema: { type: "object", additionalProperties: false, properties: { sessionHandle: opaqueHandleSchema("Persistent bridge session handle to close.") }, required: ["sessionHandle"] } },
 ];
 
-async function dispatchTool(name, args, operationId, progressToken) {
+const TOOL_NAMES = new Set(TOOL_DEFINITIONS.map((tool) => tool.name));
+
+function validateToolArguments(name, args) {
+  if (!TOOL_NAMES.has(name)) throw new Error(`Unknown tool: ${String(name)}`);
+  if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("Tool arguments must be an object.");
+  const allowed = {
+    codex_plan: new Set(["prompt", "model", "effort", "maxFollowUps"]),
+    codex_plan_unlimited: new Set(["prompt", "model", "effort", "confirmation"]),
+    codex_reply: new Set(["sessionHandle", "expectedReplyNumber", "prompt"]),
+    codex_full: new Set(["prompt", "model", "effort", "maxFollowUps"]),
+    codex_full_unlimited: new Set(["prompt", "model", "effort", "confirmation"]),
+    codex_full_reply: new Set(["sessionHandle", "expectedReplyNumber", "prompt"]),
+    codex_status: new Set(),
+    codex_capabilities: new Set(["product", "surface", "access", "query", "offset", "limit", "includeRuntime"]),
+    codex_operation: new Set(["operationHandle"]),
+    codex_operation_cancel: new Set(["operationHandle"]),
+    codex_sessions: new Set(),
+    codex_session_close: new Set(["sessionHandle"]),
+  }[name];
+  for (const key of Object.keys(args)) if (!allowed.has(key)) throw new Error(`Unexpected argument: ${key}`);
+  if (["codex_plan", "codex_plan_unlimited", "codex_full", "codex_full_unlimited"].includes(name)) {
+    requireString(args, "prompt");
+    optionalModel(args);
+    optionalEffort(args);
+  }
+  if (["codex_plan_unlimited", "codex_full_unlimited"].includes(name)) requireUnlimitedConfirmation(args, name);
+  if (name === "codex_plan" || name === "codex_full") selectedReplyLimit(args);
+  if (["codex_reply", "codex_full_reply", "codex_session_close"].includes(name)) {
+    const handle = requireString(args, "sessionHandle", 64);
+    if (!/^[0-9a-fA-F-]{36}$/.test(handle)) throw new Error("sessionHandle must be an opaque handle returned by this bridge.");
+  }
+  if (["codex_reply", "codex_full_reply"].includes(name)) {
+    requireString(args, "prompt");
+    if (!Number.isSafeInteger(args.expectedReplyNumber) || args.expectedReplyNumber < 1) {
+      throw new Error("expectedReplyNumber must be a positive safe integer.");
+    }
+  }
+  if (["codex_operation", "codex_operation_cancel"].includes(name) && args.operationHandle !== undefined) {
+    if (typeof args.operationHandle !== "string" || !/^[0-9a-fA-F-]{36}$/.test(args.operationHandle)) {
+      throw new Error("operationHandle must be an opaque handle returned by this bridge.");
+    }
+  }
+  if (name === "codex_operation_cancel" && args.operationHandle === undefined) {
+    throw new Error("operationHandle is required.");
+  }
+  if (name === "codex_capabilities") {
+    if (args.product !== undefined && !["all", "claude", "codex"].includes(args.product)) {
+      throw new Error("product must be all, claude, or codex.");
+    }
+    for (const key of ["surface", "access", "query"]) {
+      if (args[key] !== undefined && typeof args[key] !== "string") throw new Error(`${key} must be a string.`);
+    }
+    if (args.offset !== undefined && (!Number.isInteger(args.offset) || args.offset < 0)) {
+      throw new Error("offset must be a non-negative integer.");
+    }
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 50)) {
+      throw new Error("limit must be an integer between 1 and 50.");
+    }
+    if (args.includeRuntime !== undefined && typeof args.includeRuntime !== "boolean") {
+      throw new Error("includeRuntime must be a boolean.");
+    }
+  }
+}
+
+const CODEX_INFERENCE_TOOLS = new Set([
+  "codex_plan",
+  "codex_plan_unlimited",
+  "codex_reply",
+  "codex_full",
+  "codex_full_unlimited",
+  "codex_full_reply",
+]);
+
+async function executeCodexInference(name, args, operationId) {
   switch (name) {
-    case "codex_plan": return startSession(args, "review", "deep", operationId, progressToken);
-    case "codex_plan_unlimited":
-      requireUnlimitedConfirmation(args, name);
-      return startSession(args, "review", "unlimited", operationId, progressToken);
-    case "codex_reply": return continueSession(args, "review", operationId, progressToken);
-    case "codex_full": return startSession(args, "full", "deep", operationId, progressToken);
-    case "codex_full_unlimited":
-      requireUnlimitedConfirmation(args, name);
-      return startSession(args, "full", "unlimited", operationId, progressToken);
-    case "codex_full_reply": return continueSession(args, "full", operationId, progressToken);
+    case "codex_plan": return startSession(args, "review", false, operationId, undefined);
+    case "codex_plan_unlimited": return startSession(args, "review", true, operationId, undefined);
+    case "codex_reply": return continueSession(args, "review", operationId, undefined);
+    case "codex_full": return startSession(args, "full", false, operationId, undefined);
+    case "codex_full_unlimited": return startSession(args, "full", true, operationId, undefined);
+    case "codex_full_reply": return continueSession(args, "full", operationId, undefined);
+    default: throw new Error(`Unknown Codex inference tool: ${name}`);
+  }
+}
+
+function operationMetadata(operation) {
+  const startedAtMs = operation.startedAt === null ? null : Date.parse(operation.startedAt);
+  const completedAtMs = operation.completedAt === null ? null : Date.parse(operation.completedAt);
+  return {
+    operationHandle: operation.handle,
+    operationKind: operation.tool,
+    status: operation.status,
+    createdAt: operation.createdAt,
+    startedAt: operation.startedAt,
+    completedAt: operation.completedAt,
+    elapsedMs:
+      startedAtMs === null || Number.isNaN(startedAtMs)
+        ? null
+        : Math.max(0, (completedAtMs === null || Number.isNaN(completedAtMs) ? Date.now() : completedAtMs) - startedAtMs),
+    targetSessionHandle: operation.targetSessionHandle,
+    cancelRequested: operation.cancelRequested,
+    bridgeWallClockTimeout: null,
+    idleDisconnectPolicy: "never",
+  };
+}
+
+function operationView(operation, includeResult = true) {
+  const metadata = operationMetadata(operation);
+  if (!includeResult || operation.status === "queued" || operation.status === "running") {
+    return {
+      ...metadata,
+      pollWith: "codex_operation",
+      cancelWith: "codex_operation_cancel",
+      content:
+        operation.status === "running"
+          ? `Codex operation ${operation.handle} is still running. No bridge wall-clock timeout or idle disconnect is active.`
+          : operation.status === "queued"
+            ? `Codex operation ${operation.handle} is queued behind earlier work. It will wait without a bridge timeout.`
+            : `Codex operation ${operation.handle} is ${operation.status}.`,
+    };
+  }
+  if (operation.status === "completed") {
+    return {
+      ...metadata,
+      result: operation.result,
+      content: operation.result?.content || `Codex operation ${operation.handle} completed.`,
+    };
+  }
+  return {
+    ...metadata,
+    error: operation.error,
+    content: operation.error?.content || `Codex operation ${operation.handle} ${operation.status}.`,
+  };
+}
+
+function operationError(error) {
+  return {
+    status: "error",
+    content: redact(error?.message || error, 8000),
+    failureKind: /cancel/i.test(error?.message || "") ? "cancelled" : "bridge_error",
+    workspace: WORKSPACE_ROOT,
+    ...(error?.workspaceMayContainPartialChanges
+      ? { workspaceMayContainPartialChanges: true, automaticRollbackPerformed: false, inspectionRequired: true }
+      : {}),
+  };
+}
+
+function queueCodexOperation(name, args) {
+  const handle = randomUUID();
+  const operation = {
+    handle,
+    tool: name,
+    status: "queued",
+    createdAt: new Date().toISOString(),
+    startedAt: null,
+    completedAt: null,
+    targetSessionHandle: typeof args.sessionHandle === "string" ? args.sessionHandle : null,
+    cancelRequested: false,
+    result: null,
+    error: null,
+    promise: null,
+  };
+  operations.set(handle, operation);
+  const run = async () => {
+    if (operation.cancelRequested) return;
+    operation.status = "running";
+    operation.startedAt = new Date().toISOString();
+    try {
+      operation.result = await executeCodexInference(name, args, handle);
+      operation.status = "completed";
+    } catch (error) {
+      operation.error = operationError(error);
+      operation.status = operation.cancelRequested ? "cancelled" : "error";
+    } finally {
+      operation.completedAt = new Date().toISOString();
+    }
+  };
+  const promise = operationQueueTail.catch(() => {}).then(run);
+  operation.promise = promise;
+  operationQueueTail = promise.catch(() => {});
+  return {
+    status: "queued",
+    operationHandle: handle,
+    operationKind: name,
+    createdAt: operation.createdAt,
+    bridgeWallClockTimeout: null,
+    idleDisconnectPolicy: "never",
+    pollWith: "codex_operation",
+    cancelWith: "codex_operation_cancel",
+    content:
+      `Codex operation ${handle} was accepted and will continue independently of this client request. ` +
+      "Poll codex_operation until it completes; use codex_operation_cancel only for an explicit cancellation.",
+  };
+}
+
+function inspectCodexOperation(args) {
+  if (args.operationHandle !== undefined) {
+    const operation = operations.get(args.operationHandle);
+    if (!operation) throw new Error("operationHandle is unknown to this running bridge process.");
+    return operationView(operation, true);
+  }
+  const listed = [...operations.values()]
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+    .map((operation) => operationMetadata(operation));
+  return {
+    status: "ready",
+    operations: listed,
+    count: listed.length,
+    bridgeWallClockTimeout: null,
+    idleDisconnectPolicy: "never",
+    content: `This bridge process knows ${listed.length} Codex operation${listed.length === 1 ? "" : "s"}.`,
+  };
+}
+
+function cancelCodexOperation(args) {
+  const operation = operations.get(args.operationHandle);
+  if (!operation) throw new Error("operationHandle is unknown to this running bridge process.");
+  if (["completed", "error", "cancelled"].includes(operation.status)) {
+    return {
+      ...operationMetadata(operation),
+      content: `Codex operation ${operation.handle} is already ${operation.status}; no process was terminated.`,
+    };
+  }
+  operation.cancelRequested = true;
+  if (operation.status === "queued") {
+    operation.status = "cancelled";
+    operation.completedAt = new Date().toISOString();
+  } else if (activeOperation?.operationId === operation.handle) {
+    activeOperation.cancel(new Error("Codex operation was explicitly cancelled through codex_operation_cancel."));
+  }
+  return {
+    ...operationMetadata(operation),
+    content:
+      operation.status === "cancelled"
+        ? `Queued Codex operation ${operation.handle} was explicitly cancelled before it started.`
+        : `Cancellation was explicitly requested for running Codex operation ${operation.handle}. Poll codex_operation for terminal state.`,
+  };
+}
+
+function listCodexSessions() {
+  const listed = [...sessions.entries()]
+    .map(([sessionHandle, session]) => ({
+      sessionHandle,
+      createdAt: new Date(session.createdAt).toISOString(),
+      lastActivityAt: new Date(session.lastActivityAt).toISOString(),
+      ...sessionPolicy(session),
+      ...invocationMetadata(session, null),
+    }))
+    .sort((left, right) => right.lastActivityAt.localeCompare(left.lastActivityAt));
+  return {
+    status: "ready",
+    sessions: listed,
+    count: listed.length,
+    persistencePath: SESSION_STATE_PATH,
+    persistenceError: sessionPersistenceError,
+    content:
+      `${listed.length} Codex peer session${listed.length === 1 ? " is" : "s are"} open. ` +
+      "Idle sessions never expire; close one only with codex_session_close.",
+  };
+}
+
+function closeCodexSession(args) {
+  const handle = args.sessionHandle;
+  const session = sessions.get(handle);
+  if (!session) throw new Error("sessionHandle is unknown or already closed.");
+  const usingOperation = [...operations.values()].find(
+    (operation) => operation.targetSessionHandle === handle && ["queued", "running"].includes(operation.status)
+  );
+  if (usingOperation) {
+    throw new Error(
+      `Session ${handle} is being used by ${usingOperation.tool} operation ${usingOperation.handle}; ` +
+      "cancel that operation explicitly and wait for terminal state before closing the session."
+    );
+  }
+  sessions.delete(handle);
+  persistSessions();
+  return {
+    status: "closed",
+    sessionHandle: handle,
+    sessionKind: session.kind,
+    closedAt: new Date().toISOString(),
+    content: `Codex peer session ${handle} was explicitly closed.`,
+  };
+}
+
+async function dispatchTool(name, args) {
+  validateToolArguments(name, args);
+  if (CODEX_INFERENCE_TOOLS.has(name)) return queueCodexOperation(name, args);
+  switch (name) {
     case "codex_status": return codexStatus();
+    case "codex_capabilities": return codexCapabilities(args);
+    case "codex_operation": return inspectCodexOperation(args);
+    case "codex_operation_cancel": return cancelCodexOperation(args);
+    case "codex_sessions": return listCodexSessions();
+    case "codex_session_close": return closeCodexSession(args);
     default: throw new Error(`Unknown tool: ${name}`);
   }
 }
@@ -680,15 +1203,16 @@ async function handleMessage(message) {
         protocolVersion: SUPPORTED_PROTOCOL_VERSIONS.has(params?.protocolVersion) ? params.protocolVersion : PROTOCOL_VERSION,
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-        instructions: `Claude may invoke Codex proactively for an independent in-scope pass. The bridge pins all calls to ${WORKSPACE_ROOT}, offers read-only and workspace-write phases, uses opaque bounded sessions, and disables nested Codex plugins/apps/hooks/MCPs to prevent recursion.`,
+        instructions: `Claude may invoke Codex proactively for an independent in-scope pass. Inference tools return an operation handle immediately: poll codex_operation until terminal state, and use codex_operation_cancel only after an explicit cancellation request. Sessions use opaque replay-protected handles, never expire for idleness, persist across bridge restarts, and allow unlimited follow-ups by default; codex_session_close is the explicit disconnect path. Set maxFollowUps only when the user asks for concise, bounded, or an exact number of rounds. The bridge pins all calls to ${WORKSPACE_ROOT}, offers read-only and workspace-write phases, and technically disables nested Codex plugins/apps/hooks/MCPs; shell-level peer launch remains prohibited by developer instruction. Use codex_capabilities to query the versioned Claude/Codex control catalog and honor each access route—known terminal UI commands are not automatically MCP tools.`,
       },
     };
   }
   if (method === "notifications/initialized") return null;
   if (method === "notifications/cancelled") {
     const requestId = String(params?.requestId ?? "");
-    if (requestOperations.has(requestId) && activeOperation) {
-      clearClientAndSessions(new Error("Codex operation was cancelled by the MCP client."));
+    const requestOperationId = requestOperations.get(requestId);
+    if (requestOperationId && activeOperation?.operationId === requestOperationId) {
+      activeOperation.cancel(new Error("The MCP client explicitly cancelled this synchronous bridge request."));
     }
     return null;
   }
@@ -700,13 +1224,15 @@ async function handleMessage(message) {
     const requestKey = String(id);
     requestOperations.set(requestKey, operationId);
     try {
-      const structured = await dispatchTool(params?.name, params?.arguments || {}, operationId, params?._meta?.progressToken);
-      return { jsonrpc: "2.0", id, result: toolResult(structured) };
+      const structured = await dispatchTool(params?.name, params?.arguments || {});
+      const failed = ["error", "cancelled"].includes(structured.status) ||
+        (structured.status === "completed" && structured.result?.status && structured.result.status !== "done");
+      return { jsonrpc: "2.0", id, result: toolResult(structured, failed) };
     } catch (error) {
       const metadata = {
         status: "error",
         message: redact(error?.message || error, 8000),
-        failureKind: /timed out/i.test(error?.message || "") ? "timeout" : /cancel/i.test(error?.message || "") ? "cancelled" : "bridge_error",
+        failureKind: /cancel/i.test(error?.message || "") ? "cancelled" : "bridge_error",
         workspace: WORKSPACE_ROOT,
         ...(error?.workspaceMayContainPartialChanges ? { workspaceMayContainPartialChanges: true, automaticRollbackPerformed: false, inspectionRequired: true } : {}),
       };
@@ -717,6 +1243,8 @@ async function handleMessage(message) {
   }
   return jsonRpcError(id, -32601, `Method not found: ${method}`);
 }
+
+loadPersistedSessions();
 
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 input.on("line", async (line) => {

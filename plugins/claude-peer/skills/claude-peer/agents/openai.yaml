@@ -1,7 +1,7 @@
 interface:
   display_name: "Claude Peer"
-  short_description: "Fable-first Claude collaboration with verified fallback"
-  default_prompt: "Use $claude-peer with its Fable-first max-effort policy, report the observed model evidence, and bring in the full Claude Code agent for an independent implementation and verification pass."
+  short_description: "Unlimited Claude collaboration with routed controls"
+  default_prompt: "Use $claude-peer with its unlimited-by-default Fable-first max-effort policy, poll background operation handles without imposing a waiter timeout, query the routed control catalog when relevant, report observed model evidence, and bring in the full Claude Code agent for an independent implementation and verification pass."
 
 policy:
   allow_implicit_invocation: true

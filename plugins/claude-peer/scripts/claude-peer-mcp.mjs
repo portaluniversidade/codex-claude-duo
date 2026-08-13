@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,10 +16,6 @@ const MAX_PROMPT_CHARS = 60_000;
 const MAX_CONTENT_CHARS = 80_000;
 const MAX_STDOUT_BYTES = 2 * 1024 * 1024;
 const MAX_STDERR_BYTES = 512 * 1024;
-const MAX_INFERENCES_PER_MINUTE = 12;
-const SESSION_IDLE_TTL_MS = 2 * 60 * 60 * 1000;
-const DEFAULT_DEEP_REPLY_LIMIT = 6;
-const MAX_SESSIONS = 50;
 const DEFAULT_MODEL = "fable";
 const DEFAULT_EFFORT = "max";
 const MODEL_ALIASES = new Set([
@@ -49,7 +45,13 @@ const EFFORT_LEVELS = new Set(["auto", "low", "medium", "high", "xhigh", "max", 
 const MAX_FALLBACK_MODELS = 3;
 const UNLIMITED_CONFIRMATION = "USER_EXPLICITLY_REQUESTED_UNLIMITED";
 const PHYSICAL_SAFETY_SCRIPT = fileURLToPath(new URL("./worktree-physical-safety.ps1", import.meta.url));
+const CONTROL_CATALOG_PATH = fileURLToPath(new URL("../assets/control-catalog.json", import.meta.url));
 const DEFAULT_WORKSPACE_ROOT = path.join(homedir(), "Desktop", "\u200e", "Notes", "AI");
+const STATE_ROOT = path.resolve(
+  process.env.CLAUDE_PEER_STATE_DIR ||
+  path.join(process.env.LOCALAPPDATA || path.join(homedir(), ".local", "state"), "codex-claude-duo")
+);
+const SESSION_STATE_PATH = path.join(STATE_ROOT, "claude-peer-sessions.json");
 // Persistent, user-owned root policy. It lives in the operator's own workspace instead of the
 // plugin cache so it survives plugin reinstalls, and it is re-read on every call so a newly
 // spawned bridge process picks up the current policy without editing any process environment.
@@ -61,10 +63,12 @@ const FALSY_POLICY_VALUES = new Set(["0", "false", "no", "off"]);
 const active = new Map();
 const requestOperations = new Map();
 const sessions = new Map();
-const inferenceStarts = [];
+const operations = new Map();
 let cachedClaudeBinary;
 let lifecycle = "new";
 let stdoutBroken = false;
+let sessionPersistenceError = null;
+let operationQueueTail = Promise.resolve();
 
 function readPluginVersion() {
   try {
@@ -83,23 +87,14 @@ const PHASES = Object.freeze({
   plan: {
     permissionMode: "plan",
     tools: "Read,Glob",
-    defaultTurns: 12,
-    maxTurns: 24,
-    timeoutMs: 15 * 60 * 1000,
   },
   implement: {
     permissionMode: "dontAsk",
     tools: "Read,Glob,Edit,Write",
-    defaultTurns: 10,
-    maxTurns: 12,
-    timeoutMs: 15 * 60 * 1000,
   },
   full: {
     permissionMode: "auto",
     tools: "default",
-    defaultTurns: 24,
-    maxTurns: 1000,
-    timeoutMs: 60 * 60 * 1000,
   },
 });
 
@@ -212,12 +207,50 @@ function fallbackModelsSchema(full = false) {
   };
 }
 
+function followUpLimitSchema() {
+  return {
+    type: "integer",
+    minimum: 0,
+    description:
+      "Optional numerical follow-up cap. Omit it for the default unlimited back-and-forth policy. Set it only when the user asks for concise, bounded, or an exact number of collaboration rounds.",
+  };
+}
+
+function turnLimitSchema() {
+  return {
+    type: "integer",
+    minimum: 1,
+    description:
+      "Optional internal Claude turn cap. Omit it by default so a working call has no bridge-imposed turn ceiling; set it only for an explicitly bounded request.",
+  };
+}
+
+function opaqueHandleSchema(description) {
+  return { type: "string", pattern: "^[0-9a-fA-F-]{36}$", description };
+}
+
+function capabilityQuerySchema() {
+  return {
+    type: "object",
+    properties: {
+      product: { type: "string", enum: ["all", "claude", "codex"], default: "all" },
+      surface: { type: "string", minLength: 1, maxLength: 80 },
+      access: { type: "string", minLength: 1, maxLength: 80 },
+      query: { type: "string", maxLength: 200 },
+      offset: { type: "integer", minimum: 0, default: 0 },
+      limit: { type: "integer", minimum: 1, maximum: 50, default: 25 },
+      includeRuntime: { type: "boolean", default: true },
+    },
+    additionalProperties: false,
+  };
+}
+
 const TOOL_DEFINITIONS = [
   {
     name: "claude_plan",
     title: "Ask Claude peer",
     description:
-      "Start a persistent, read-only deep-review session with up to six Claude follow-ups inside an allowlisted workspace.",
+      "Queue a persistent read-only Claude peer with unlimited follow-ups by default inside an allowlisted workspace. Returns immediately with an operation handle; poll claude_operation. Set maxFollowUps only when the user asks for concise or bounded collaboration.",
     inputSchema: {
       type: "object",
       properties: {
@@ -226,7 +259,8 @@ const TOOL_DEFINITIONS = [
         model: modelSelectorSchema(),
         effort: effortSchema(),
         fallbackModels: fallbackModelsSchema(),
-        maxTurns: { type: "integer", minimum: 1, maximum: PHASES.plan.maxTurns },
+        maxTurns: turnLimitSchema(),
+        maxFollowUps: followUpLimitSchema(),
       },
       required: ["prompt", "cwd"],
       additionalProperties: false,
@@ -235,9 +269,9 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: "claude_plan_unlimited",
-    title: "Start uncapped Claude review",
+    title: "Start uncapped Claude review (compatibility alias)",
     description:
-      "Start a read-only Claude review session with no numerical reply cap. Use only when the user explicitly requests unlimited or uncapped back-and-forth.",
+      "Compatibility alias that queues an uncapped read-only Claude session and returns an operation handle. Ordinary claude_plan sessions are already unlimited by default.",
     inputSchema: {
       type: "object",
       properties: {
@@ -246,7 +280,7 @@ const TOOL_DEFINITIONS = [
         model: modelSelectorSchema(),
         effort: effortSchema(),
         fallbackModels: fallbackModelsSchema(),
-        maxTurns: { type: "integer", minimum: 1, maximum: PHASES.plan.maxTurns },
+        maxTurns: turnLimitSchema(),
         confirmation: {
           type: "string",
           enum: [UNLIMITED_CONFIRMATION],
@@ -262,13 +296,13 @@ const TOOL_DEFINITIONS = [
     name: "claude_reply",
     title: "Reply to Claude peer",
     description:
-      "Continue a bridge-created Claude review session. Deep sessions allow six follow-ups; explicitly uncapped sessions have no numerical reply limit.",
+      "Queue a continuation of a bridge-created Claude review session and return an operation handle. Sessions never expire for idleness and are unlimited by default; a cap exists only when maxFollowUps was deliberately set.",
     inputSchema: {
       type: "object",
       properties: {
-        sessionHandle: { type: "string", pattern: "^[0-9a-fA-F-]{36}$" },
+        sessionHandle: opaqueHandleSchema("Opaque persistent review-session handle."),
         prompt: { type: "string", minLength: 1, maxLength: MAX_PROMPT_CHARS },
-        maxTurns: { type: "integer", minimum: 1, maximum: PHASES.plan.maxTurns },
+        maxTurns: turnLimitSchema(),
         expectedReplyNumber: {
           type: "integer",
           minimum: 1,
@@ -285,7 +319,7 @@ const TOOL_DEFINITIONS = [
     name: "claude_implement",
     title: "Let Claude edit isolated worktree",
     description:
-      "Consume a one-use authorization marker and let Claude edit only an isolated, clean Claude worktree. This is a sensitive write operation.",
+      "Queue a sensitive write operation that consumes a one-use authorization marker and lets Claude edit only an isolated, clean Claude worktree. Poll claude_operation for its result.",
     inputSchema: {
       type: "object",
       properties: {
@@ -294,7 +328,7 @@ const TOOL_DEFINITIONS = [
         model: modelSelectorSchema(),
         effort: effortSchema(),
         fallbackModels: fallbackModelsSchema(),
-        maxTurns: { type: "integer", minimum: 1, maximum: PHASES.implement.maxTurns },
+        maxTurns: turnLimitSchema(),
       },
       required: ["prompt", "cwd"],
       additionalProperties: false,
@@ -305,7 +339,7 @@ const TOOL_DEFINITIONS = [
     name: "claude_full",
     title: "Run full Claude Code agent",
     description:
-      "Start a persistent, fully tool-capable Claude Code agent in an operator-approved workspace. Claude may edit files, run shell commands and tests, and use built-in network tools. Codex may invoke this proactively when the current top-level task already authorizes mutations; use read-only review otherwise.",
+      "Queue a persistent, fully tool-capable Claude Code agent with unlimited follow-ups by default in an operator-approved workspace and return an operation handle immediately. Claude may edit files, run commands/tests, and use built-in network tools; poll claude_operation until done.",
     inputSchema: {
       type: "object",
       properties: {
@@ -317,9 +351,9 @@ const TOOL_DEFINITIONS = [
         maxTurns: {
           type: "integer",
           minimum: 1,
-          maximum: PHASES.full.maxTurns,
-          description: "Internal-turn ceiling for this call. Defaults to 24; may be raised explicitly up to 1000.",
+          description: "Optional per-call internal-turn ceiling. Omit it under the default unlimited collaboration policy; set it only when a bounded call is useful.",
         },
+        maxFollowUps: followUpLimitSchema(),
       },
       required: ["prompt"],
       additionalProperties: false,
@@ -328,9 +362,9 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: "claude_full_unlimited",
-    title: "Run uncapped full Claude Code agent",
+    title: "Run uncapped full Claude Code agent (compatibility alias)",
     description:
-      "Start a persistent full-tool Claude Code agent with no numerical reply cap. Use only when the user explicitly requests unlimited or uncapped full-agent back-and-forth.",
+      "Compatibility alias that queues an uncapped full-tool Claude Code session and returns an operation handle. Ordinary claude_full sessions are already unlimited by default.",
     inputSchema: {
       type: "object",
       properties: {
@@ -339,7 +373,7 @@ const TOOL_DEFINITIONS = [
         model: modelSelectorSchema(true),
         effort: effortSchema(),
         fallbackModels: fallbackModelsSchema(true),
-        maxTurns: { type: "integer", minimum: 1, maximum: PHASES.full.maxTurns },
+        maxTurns: turnLimitSchema(),
         confirmation: {
           type: "string",
           enum: [UNLIMITED_CONFIRMATION],
@@ -355,17 +389,16 @@ const TOOL_DEFINITIONS = [
     name: "claude_full_reply",
     title: "Continue full Claude Code agent",
     description:
-      "Continue a persistent full-access Claude session. Ordinary full sessions allow six follow-ups; explicitly uncapped full sessions have no numerical reply cap. The requested model selector, effort, availability fallback chain, workspace, and permission policy stay fixed; request settings and aggregate observed model evidence are reported separately per call.",
+      "Queue a continuation of a persistent full-access Claude session and return an operation handle. Sessions never expire for idleness and are unlimited by default; model, effort, fallback, workspace, and permission policy stay fixed.",
     inputSchema: {
       type: "object",
       properties: {
-        sessionHandle: { type: "string", pattern: "^[0-9a-fA-F-]{36}$" },
+        sessionHandle: opaqueHandleSchema("Opaque persistent full-session handle."),
         prompt: { type: "string", minLength: 1, maxLength: MAX_PROMPT_CHARS },
         maxTurns: {
           type: "integer",
           minimum: 1,
-          maximum: PHASES.full.maxTurns,
-          description: "Internal-turn ceiling. Bounded sessions default to 24; explicitly unlimited sessions omit the bridge ceiling when this field is absent.",
+          description: "Optional per-call internal-turn ceiling. Unlimited sessions omit the bridge ceiling when this field is absent.",
         },
         expectedReplyNumber: {
           type: "integer",
@@ -386,6 +419,57 @@ const TOOL_DEFINITIONS = [
       "Check native Claude Code availability/version, Max subscription authentication, billing conflicts, root configuration, Fable/max defaults, selectable models/efforts, fallback policy, and observability limits without returning credentials or account identifiers.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+  },
+  {
+    name: "claude_capabilities",
+    title: "Query Claude and Codex controls",
+    description:
+      "Query the versioned control catalog covering Claude/Codex interactive commands, CLI commands and flags, agent tools, bridge tools, shortcuts, deep links, and truthful access routes. Use pagination to inspect every entry.",
+    inputSchema: capabilityQuerySchema(),
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+  },
+  {
+    name: "claude_operation",
+    title: "Inspect Claude operation",
+    description:
+      "List background Claude operations or retrieve one completed/running result. Long work has no bridge wall-clock timeout and remains retrievable after a client waiter detaches.",
+    inputSchema: {
+      type: "object",
+      properties: { operationHandle: opaqueHandleSchema("Optional operation handle. Omit it to list all operations.") },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+  },
+  {
+    name: "claude_operation_cancel",
+    title: "Cancel Claude operation",
+    description: "Explicitly cancel one running Claude operation. Idle sessions are not closed by cancellation unless their continuation becomes ambiguous.",
+    inputSchema: {
+      type: "object",
+      properties: { operationHandle: opaqueHandleSchema("Running operation handle to cancel.") },
+      required: ["operationHandle"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+  },
+  {
+    name: "claude_sessions",
+    title: "List Claude peer sessions",
+    description: "List persistent opaque Claude peer sessions. Sessions do not expire for idleness and raw Claude IDs are never returned.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+  },
+  {
+    name: "claude_session_close",
+    title: "Close Claude peer session",
+    description: "Explicitly close one idle bridge session handle. This is the normal way to disconnect a peer session.",
+    inputSchema: {
+      type: "object",
+      properties: { sessionHandle: opaqueHandleSchema("Persistent bridge session handle to close.") },
+      required: ["sessionHandle"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
   },
 ];
 
@@ -1183,14 +1267,19 @@ function isSafeClaudeSessionId(value) {
 function validateToolArguments(name, args) {
   if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("Tool arguments must be an object.");
   const allowedKeys = {
-    claude_plan: new Set(["prompt", "cwd", "model", "effort", "fallbackModels", "maxTurns"]),
+    claude_plan: new Set(["prompt", "cwd", "model", "effort", "fallbackModels", "maxTurns", "maxFollowUps"]),
     claude_plan_unlimited: new Set(["prompt", "cwd", "model", "effort", "fallbackModels", "maxTurns", "confirmation"]),
     claude_reply: new Set(["sessionHandle", "prompt", "maxTurns", "expectedReplyNumber"]),
     claude_implement: new Set(["prompt", "cwd", "model", "effort", "fallbackModels", "maxTurns"]),
-    claude_full: new Set(["prompt", "cwd", "model", "effort", "fallbackModels", "maxTurns"]),
+    claude_full: new Set(["prompt", "cwd", "model", "effort", "fallbackModels", "maxTurns", "maxFollowUps"]),
     claude_full_unlimited: new Set(["prompt", "cwd", "model", "effort", "fallbackModels", "maxTurns", "confirmation"]),
     claude_full_reply: new Set(["sessionHandle", "prompt", "maxTurns", "expectedReplyNumber"]),
     claude_status: new Set(),
+    claude_capabilities: new Set(["product", "surface", "access", "query", "offset", "limit", "includeRuntime"]),
+    claude_operation: new Set(["operationHandle"]),
+    claude_operation_cancel: new Set(["operationHandle"]),
+    claude_sessions: new Set(),
+    claude_session_close: new Set(["sessionHandle"]),
   }[name];
   for (const key of Object.keys(args)) {
     if (!allowedKeys.has(key)) throw new Error(`Unexpected argument: ${key}`);
@@ -1221,26 +1310,47 @@ function validateToolArguments(name, args) {
       `${name} requires confirmation=${UNLIMITED_CONFIRMATION} after an explicit user request.`
     );
   }
+  if (name === "claude_plan" || name === "claude_full") selectedReplyLimit(args);
+  if (["claude_operation", "claude_operation_cancel"].includes(name) && args.operationHandle !== undefined) {
+    if (typeof args.operationHandle !== "string" || !/^[0-9a-fA-F-]{36}$/.test(args.operationHandle)) {
+      throw new Error("operationHandle must be an opaque handle returned by this bridge.");
+    }
+  }
+  if (name === "claude_operation_cancel" && args.operationHandle === undefined) {
+    throw new Error("operationHandle is required.");
+  }
+  if (name === "claude_session_close") {
+    const handle = requireString(args, "sessionHandle", 64);
+    if (!/^[0-9a-fA-F-]{36}$/.test(handle)) throw new Error("sessionHandle must be an opaque handle returned by this bridge.");
+  }
+  if (name === "claude_capabilities") {
+    if (args.product !== undefined && !["all", "claude", "codex"].includes(args.product)) {
+      throw new Error("product must be all, claude, or codex.");
+    }
+    for (const key of ["surface", "access", "query"]) {
+      if (args[key] !== undefined && typeof args[key] !== "string") throw new Error(`${key} must be a string.`);
+    }
+    if (args.offset !== undefined && (!Number.isInteger(args.offset) || args.offset < 0)) {
+      throw new Error("offset must be a non-negative integer.");
+    }
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 50)) {
+      throw new Error("limit must be an integer between 1 and 50.");
+    }
+    if (args.includeRuntime !== undefined && typeof args.includeRuntime !== "boolean") {
+      throw new Error("includeRuntime must be a boolean.");
+    }
+  }
   if (args.maxTurns !== undefined) {
-    const phase = name === "claude_implement"
-      ? PHASES.implement
-      : name === "claude_full" || name === "claude_full_unlimited" || name === "claude_full_reply"
-        ? PHASES.full
-        : PHASES.plan;
-    if (!Number.isInteger(args.maxTurns) || args.maxTurns < 1 || args.maxTurns > phase.maxTurns) {
-      throw new Error(`maxTurns must be an integer between 1 and ${phase.maxTurns}.`);
+    if (!Number.isSafeInteger(args.maxTurns) || args.maxTurns < 1) {
+      throw new Error("maxTurns must be a positive safe integer.");
     }
   }
 }
 
-function enforceInferenceLimit() {
-  if (active.size > 0) throw new Error("Another Claude inference is already active; concurrent calls are refused.");
-  const cutoff = Date.now() - 60_000;
-  while (inferenceStarts.length > 0 && inferenceStarts[0] < cutoff) inferenceStarts.shift();
-  if (inferenceStarts.length >= MAX_INFERENCES_PER_MINUTE) {
-    throw new Error(`Rate limit reached: at most ${MAX_INFERENCES_PER_MINUTE} Claude inferences may start per minute.`);
+function enforceSerialInferenceInvariant() {
+  if (active.size > 0) {
+    throw new Error("Internal queue invariant failed: another Claude inference is already active.");
   }
-  inferenceStarts.push(Date.now());
 }
 
 function terminateProcessTree(child) {
@@ -1257,7 +1367,7 @@ function terminateProcessTree(child) {
   return child.kill("SIGTERM");
 }
 
-function runProcess({ binary, args, cwd, input, operationId, timeoutMs, progressToken, environmentOverrides = {} }) {
+function runProcess({ binary, args, cwd, input, operationId, progressToken, environmentOverrides = {} }) {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
     const child = spawn(binary, args, {
@@ -1268,7 +1378,6 @@ function runProcess({ binary, args, cwd, input, operationId, timeoutMs, progress
       shell: false,
     });
 
-    active.set(operationId, child);
     const stdoutChunks = [];
     const stderrChunks = [];
     let stdoutBytes = 0;
@@ -1286,9 +1395,7 @@ function runProcess({ binary, args, cwd, input, operationId, timeoutMs, progress
       }
     };
 
-    const timer = setTimeout(() => {
-      requestTermination(new Error(`Claude operation timed out after ${Math.round(timeoutMs / 1000)} seconds.`));
-    }, timeoutMs);
+    active.set(operationId, { child, cancel: requestTermination });
     const progressTimer = progressToken === undefined
       ? null
       : setInterval(() => {
@@ -1297,15 +1404,13 @@ function runProcess({ binary, args, cwd, input, operationId, timeoutMs, progress
             method: "notifications/progress",
             params: {
               progressToken,
-              progress: Math.min(0.95, (Date.now() - startedAt) / timeoutMs),
-              total: 1,
-              message: "Claude peer is still working.",
+              progress: Math.floor((Date.now() - startedAt) / 1000),
+              message: "Claude peer is still working; no bridge wall-clock timeout is running.",
             },
           });
         }, 30_000);
 
     const cleanup = () => {
-      clearTimeout(timer);
       if (progressTimer) clearInterval(progressTimer);
       active.delete(operationId);
     };
@@ -1363,21 +1468,75 @@ function runProcess({ binary, args, cwd, input, operationId, timeoutMs, progress
   });
 }
 
-function maxTurns(args, phase) {
-  const requested = args.maxTurns ?? phase.defaultTurns;
-  if (!Number.isInteger(requested) || requested < 1 || requested > phase.maxTurns) {
-    throw new Error(`maxTurns must be between 1 and ${phase.maxTurns}.`);
+function optionalMaxTurns(args) {
+  if (args.maxTurns === undefined) return null;
+  const requested = args.maxTurns;
+  if (!Number.isSafeInteger(requested) || requested < 1) {
+    throw new Error("maxTurns must be a positive safe integer.");
   }
   return requested;
 }
 
-function optionalMaxTurns(args, phase) {
-  if (args.maxTurns === undefined) return null;
-  const requested = args.maxTurns;
-  if (!Number.isInteger(requested) || requested < 1 || requested > phase.maxTurns) {
-    throw new Error(`maxTurns must be between 1 and ${phase.maxTurns}.`);
+function selectedReplyLimit(args, forceUnlimited = false) {
+  if (forceUnlimited || args.maxFollowUps === undefined) return null;
+  if (!Number.isSafeInteger(args.maxFollowUps) || args.maxFollowUps < 0) {
+    throw new Error("maxFollowUps must be a non-negative safe integer.");
   }
-  return requested;
+  return args.maxFollowUps;
+}
+
+function readControlCatalog() {
+  const raw = readFileSync(CONTROL_CATALOG_PATH, "utf8");
+  if (Buffer.byteLength(raw, "utf8") > MAX_STDOUT_BYTES) throw new Error("The control catalog exceeds the 2 MiB safety limit.");
+  const catalog = JSON.parse(raw);
+  if (!Array.isArray(catalog.entries)) throw new Error("The control catalog is malformed: entries must be an array.");
+  return catalog;
+}
+
+function claudeCapabilities(args) {
+  const catalog = readControlCatalog();
+  const product = args.product ?? "all";
+  const surface = args.surface?.toLowerCase() ?? null;
+  const access = args.access?.toLowerCase() ?? null;
+  const query = args.query?.trim().toLowerCase() ?? "";
+  const offset = args.offset ?? 0;
+  const limit = args.limit ?? 25;
+  const filtered = catalog.entries.filter((entry) => {
+    if (product !== "all" && entry.product !== product) return false;
+    if (surface && String(entry.surface).toLowerCase() !== surface) return false;
+    if (access && String(entry.access).toLowerCase() !== access) return false;
+    if (query) {
+      const haystack = JSON.stringify([entry.name, entry.aliases, entry.syntax, entry.purpose, entry.route]).toLowerCase();
+      if (!haystack.includes(query)) return false;
+    }
+    return true;
+  });
+  const page = filtered.slice(offset, offset + limit);
+  const nextOffset = offset + page.length < filtered.length ? offset + page.length : null;
+  const response = {
+    status: "ready",
+    catalogSchemaVersion: catalog.schemaVersion,
+    generatedAt: catalog.generatedAt,
+    completeness: catalog.completeness,
+    coverage: catalog.coverage,
+    sourceSnapshots: catalog.sourceSnapshots,
+    accessLegend: catalog.accessLegend,
+    sources: catalog.sources,
+    ...(args.includeRuntime === false ? {} : { runtimeObservations: catalog.runtimeObservations }),
+    filters: { product, surface, access, query },
+    totalMatches: filtered.length,
+    offset,
+    returned: page.length,
+    nextOffset,
+    entries: page,
+  };
+  return {
+    ...response,
+    content:
+      `Control catalog page: ${page.length} of ${filtered.length} matching entries at offset ${offset}. ` +
+      `nextOffset=${nextOffset === null ? "none" : nextOffset}. Access labels are authoritative; known UI commands are not automatically remote tools.\n` +
+      JSON.stringify(page, null, 2),
+  };
 }
 
 function addModelAndEffort(args, model, effort, fallbackModels = []) {
@@ -1418,14 +1577,9 @@ function claudeArguments(
   ];
   addModelAndEffort(args, model, effort, fallbackModels);
   if (allowedEditPaths.length > 0) args.push("--allowedTools", ...editPermissionRules(allowedEditPaths));
-  args.push(
-    "--disallowedTools",
-    ...SENSITIVE_TOOL_RULES,
-    "--max-turns",
-    String(turns),
-    "--append-system-prompt",
-    `${PEER_SYSTEM_PROMPT}${extraPrompt ? ` ${extraPrompt}` : ""}`
-  );
+  args.push("--disallowedTools", ...SENSITIVE_TOOL_RULES);
+  if (turns !== null) args.push("--max-turns", String(turns));
+  args.push("--append-system-prompt", `${PEER_SYSTEM_PROMPT}${extraPrompt ? ` ${extraPrompt}` : ""}`);
   if (resumeSessionId) args.push("--resume", resumeSessionId);
   return args;
 }
@@ -1642,16 +1796,67 @@ function fullAgentFailure(error, detail) {
   return wrapped;
 }
 
-function purgeSessions() {
-  const cutoff = Date.now() - SESSION_IDLE_TTL_MS;
-  for (const [handle, session] of sessions) {
-    if (session.lastActivityAt < cutoff) sessions.delete(handle);
+function isPersistableSession(handle, session) {
+  return /^[0-9a-fA-F-]{36}$/.test(handle) &&
+    ["review", "full"].includes(session?.kind) &&
+    isSafeClaudeSessionId(session?.claudeSessionId) &&
+    typeof session?.cwd === "string" && path.isAbsolute(session.cwd) &&
+    ["unlimited", "bounded"].includes(session?.mode) &&
+    typeof session?.model === "string" &&
+    typeof session?.effort === "string" &&
+    Array.isArray(session?.fallbackModels) && session.fallbackModels.every((value) => typeof value === "string") &&
+    (session?.replyLimit === null || (Number.isSafeInteger(session.replyLimit) && session.replyLimit >= 0)) &&
+    Number.isSafeInteger(session?.replies) && session.replies >= 0 &&
+    typeof session?.inFlight === "boolean" &&
+    Number.isFinite(session?.createdAt) && Number.isFinite(session?.lastActivityAt);
+}
+
+function persistSessions() {
+  try {
+    mkdirSync(STATE_ROOT, { recursive: true });
+    const payload = {
+      schemaVersion: 1,
+      updatedAt: new Date().toISOString(),
+      sessions: [...sessions.entries()].map(([handle, session]) => ({ handle, ...session })),
+    };
+    const temporary = `${SESSION_STATE_PATH}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(temporary, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    try {
+      renameSync(temporary, SESSION_STATE_PATH);
+    } catch {
+      if (existsSync(SESSION_STATE_PATH)) unlinkSync(SESSION_STATE_PATH);
+      renameSync(temporary, SESSION_STATE_PATH);
+    }
+    sessionPersistenceError = null;
+  } catch (error) {
+    sessionPersistenceError = redact(error?.message || error, 2000);
+  }
+}
+
+function loadPersistedSessions() {
+  if (!existsSync(SESSION_STATE_PATH)) return;
+  try {
+    const payload = JSON.parse(readFileSync(SESSION_STATE_PATH, "utf8"));
+    if (payload?.schemaVersion !== 1 || !Array.isArray(payload.sessions)) {
+      throw new Error("Unsupported or malformed session-state file.");
+    }
+    let droppedAmbiguous = false;
+    for (const entry of payload.sessions) {
+      const { handle, ...storedSession } = entry || {};
+      const session = { ...storedSession, inFlight: storedSession?.inFlight === true };
+      if (isPersistableSession(handle, session) && !session.inFlight) sessions.set(handle, session);
+      else if (session.inFlight === true) droppedAmbiguous = true;
+    }
+    sessionPersistenceError = null;
+    if (droppedAmbiguous) persistSessions();
+  } catch (error) {
+    sessionPersistenceError = redact(error?.message || error, 2000);
   }
 }
 
 function sessionPolicy(session) {
   const replyLimit = session.replyLimit;
-  const canReply = replyLimit === null || session.replies < replyLimit;
+  const canReply = !session.inFlight && (replyLimit === null || session.replies < replyLimit);
   return {
     reviewMode: session.mode,
     sessionMode: session.mode,
@@ -1661,40 +1866,38 @@ function sessionPolicy(session) {
     repliesRemaining: replyLimit === null ? null : Math.max(0, replyLimit - session.replies),
     canReply,
     nextReplyNumber: canReply ? session.replies + 1 : null,
-    sessionState: canReply ? "open" : "exhausted",
-    idleExpiresAt: new Date(session.lastActivityAt + SESSION_IDLE_TTL_MS).toISOString(),
+    sessionState: session.inFlight ? "busy" : canReply ? "open" : "exhausted",
+    idleExpiresAt: null,
+    idleDisconnectPolicy: "never",
+    explicitCloseRequired: true,
+    persistedAcrossBridgeRestarts: sessionPersistenceError === null,
   };
 }
 
-async function claudePlan(args, progressToken, operationId, mode = "deep") {
+async function claudePlan(args, progressToken, operationId, forceUnlimited = false) {
   const prompt = requireString(args, "prompt");
   const cwd = canonicalDirectory(requireString(args, "cwd", 32_767));
   const model = selectedModel(args);
   const effort = selectedEffort(args, model);
   const fallbackModels = selectedFallbackModels(args, model);
-  purgeSessions();
-  if (sessions.size >= MAX_SESSIONS) {
-    throw new Error(
-      `The bridge already holds ${MAX_SESSIONS} active review sessions. Restart the Codex session or wait for an idle session to expire.`
-    );
-  }
+  const replyLimit = selectedReplyLimit(args, forceUnlimited);
+  const mode = replyLimit === null ? "unlimited" : "bounded";
   const binary = resolveClaudeBinary();
   requireSubscriptionAuth(binary);
-  enforceInferenceLimit();
-  const modePrompt = mode === "unlimited"
-    ? "This phase is read-only. The user explicitly requested an uncapped cross-critique session. There is no numerical reply limit; keep examining evidence and disagreement without pretending that first-pass agreement is final."
-    : `This phase is read-only. This is a deep-review session with up to ${DEFAULT_DEEP_REPLY_LIMIT} cross-critique follow-ups after this response. Investigate thoroughly and leave concrete claims open to challenge.`;
+  enforceSerialInferenceInvariant();
+  const modePrompt = replyLimit === null
+    ? "This phase is read-only. Cross-critique has no numerical reply limit by default. Keep examining material evidence and disagreement until the work genuinely converges or the user stops it; do not spend ceremonial turns after convergence."
+    : `This phase is read-only. The user requested a concise or bounded collaboration with at most ${replyLimit} follow-up${replyLimit === 1 ? "" : "s"} after this response. Investigate efficiently and prioritize the strongest unresolved issue.`;
   let processResult;
   let parsed;
   let content;
   try {
     processResult = await runProcess({
       binary,
-      args: claudeArguments(PHASES.plan, maxTurns(args, PHASES.plan), null, modePrompt, [], model, effort, fallbackModels),
+      args: claudeArguments(PHASES.plan, optionalMaxTurns(args), null, modePrompt, [], model, effort, fallbackModels),
       cwd,
       input: prompt,
       operationId,
-      timeoutMs: PHASES.plan.timeoutMs,
       progressToken,
     });
     ({ parsed, content } = parseClaudeResult(processResult));
@@ -1707,9 +1910,9 @@ async function claudePlan(args, progressToken, operationId, mode = "deep") {
     reviewMode: mode,
     sessionMode: mode,
     sessionKind: "review",
-    replyLimit: mode === "unlimited" ? null : DEFAULT_DEEP_REPLY_LIMIT,
+    replyLimit,
     repliesUsed: 0,
-    repliesRemaining: mode === "unlimited" ? null : DEFAULT_DEEP_REPLY_LIMIT,
+    repliesRemaining: replyLimit,
     canReply: false,
     nextReplyNumber: null,
     sessionState: "unavailable",
@@ -1726,12 +1929,14 @@ async function claudePlan(args, progressToken, operationId, mode = "deep") {
       model,
       effort,
       fallbackModels,
-      replyLimit: mode === "unlimited" ? null : DEFAULT_DEEP_REPLY_LIMIT,
+      replyLimit,
       replies: 0,
+      inFlight: false,
       createdAt: now,
       lastActivityAt: now,
     };
     sessions.set(sessionHandle, session);
+    persistSessions();
     policy = sessionPolicy(session);
   }
   return {
@@ -1746,7 +1951,6 @@ async function claudePlan(args, progressToken, operationId, mode = "deep") {
 }
 
 async function claudeReply(args, progressToken, operationId) {
-  purgeSessions();
   const handle = requireString(args, "sessionHandle", 64);
   const session = sessions.get(handle);
   if (!session) {
@@ -1760,7 +1964,7 @@ async function claudeReply(args, progressToken, operationId) {
   if (session.replyLimit !== null && session.replies >= session.replyLimit) {
     throw new Error(
       `This deep-review session already used all ${session.replyLimit} permitted replies. ` +
-      "Start a new review, or explicitly ask for an unlimited back-and-forth session."
+      "Start a new unlimited-by-default review or choose a larger maxFollowUps value."
     );
   }
   const nextReply = session.replies + 1;
@@ -1774,14 +1978,16 @@ async function claudeReply(args, progressToken, operationId) {
   const cwd = canonicalDirectory(session.cwd);
   const binary = resolveClaudeBinary();
   requireSubscriptionAuth(binary);
-  enforceInferenceLimit();
+  enforceSerialInferenceInvariant();
   session.lastActivityAt = Date.now();
+  session.inFlight = true;
+  persistSessions();
   const isFinalDeepReply = session.replyLimit !== null && nextReply === session.replyLimit;
   const replyPrompt = session.mode === "unlimited"
-    ? `This is read-only uncapped cross-critique reply ${nextReply}. The user explicitly removed the numerical reply ceiling. Address the newest evidence and unresolved disagreements in depth; do not manufacture disagreement once the analysis genuinely converges.`
+    ? `This is read-only cross-critique reply ${nextReply} in the default unlimited session. Address the newest evidence and unresolved disagreements in depth; do not manufacture disagreement once the analysis genuinely converges.`
     : isFinalDeepReply
-      ? `This is read-only deep-review reply ${nextReply} of ${session.replyLimit}, the final default-depth follow-up. Resolve the strongest remaining objections, state residual uncertainty, and produce a conclusion that Codex can reconcile.`
-      : `This is read-only deep-review reply ${nextReply} of ${session.replyLimit}. Challenge the newest evidence, correct weak assumptions, and deepen the analysis instead of prematurely concluding.`;
+      ? `This is read-only bounded-review reply ${nextReply} of ${session.replyLimit}, the final requested follow-up. Resolve the strongest remaining objections, state residual uncertainty, and produce a conclusion that Codex can reconcile.`
+      : `This is read-only bounded-review reply ${nextReply} of ${session.replyLimit}. Challenge the newest evidence, correct weak assumptions, and deepen the analysis instead of prematurely concluding.`;
   let processResult;
   let parsed;
   let content;
@@ -1790,7 +1996,7 @@ async function claudeReply(args, progressToken, operationId) {
       binary,
       args: claudeArguments(
         PHASES.plan,
-        maxTurns(args, PHASES.plan),
+        optionalMaxTurns(args),
         session.claudeSessionId,
         replyPrompt,
         [],
@@ -1801,12 +2007,12 @@ async function claudeReply(args, progressToken, operationId) {
       cwd,
       input: prompt,
       operationId,
-      timeoutMs: PHASES.plan.timeoutMs,
       progressToken,
     });
     ({ parsed, content } = parseClaudeResult(processResult));
   } catch (error) {
     sessions.delete(handle);
+    persistSessions();
     const annotated = annotateInvocationError(error, session.model, session.effort, session.fallbackModels, processResult);
     const closed = new Error(`${error.message} The review session was closed because its continuation state is now ambiguous.`);
     closed.invocationMetadata = invocationMetadata(annotated);
@@ -1815,12 +2021,15 @@ async function claudeReply(args, progressToken, operationId) {
   const resumedSessionId = parsed.session_id || parsed.sessionId;
   if (!isSafeClaudeSessionId(resumedSessionId) || resumedSessionId !== session.claudeSessionId) {
     sessions.delete(handle);
+    persistSessions();
     const mismatch = new Error("Claude returned a missing or different session identity while resuming; the review session was closed.");
     mismatch.failureKind = "session_identity_mismatch";
     throw annotateInvocationError(mismatch, session.model, session.effort, session.fallbackModels, processResult);
   }
   session.replies = nextReply;
   session.lastActivityAt = Date.now();
+  session.inFlight = false;
+  persistSessions();
   return {
     status: "done",
     sessionHandle: handle,
@@ -1832,26 +2041,22 @@ async function claudeReply(args, progressToken, operationId) {
   };
 }
 
-async function claudeFull(args, progressToken, operationId, mode = "deep") {
+async function claudeFull(args, progressToken, operationId, forceUnlimited = false) {
   const prompt = requireString(args, "prompt");
   const cwd = canonicalDirectory(args.cwd === undefined ? DEFAULT_WORKSPACE_ROOT : requireString(args, "cwd", 32_767));
   const model = selectedModel(args);
   const effort = selectedEffort(args, model);
   const fallbackModels = selectedFallbackModels(args, model, true);
+  const replyLimit = selectedReplyLimit(args, forceUnlimited);
+  const mode = replyLimit === null ? "unlimited" : "bounded";
   validateFullModel(model);
-  purgeSessions();
-  if (sessions.size >= MAX_SESSIONS) {
-    throw new Error(
-      `The bridge already holds ${MAX_SESSIONS} active Claude sessions. Restart Codex or wait for an idle session to expire.`
-    );
-  }
   const binary = resolveClaudeBinary();
   requireSubscriptionAuth(binary);
-  enforceInferenceLimit();
-  const modePrompt = mode === "unlimited"
-    ? "This is an explicitly uncapped full-agent session. You have all built-in Claude Code tools and may make real workspace changes. There is no numerical reply ceiling; continue productively until the task converges or the user stops it."
-    : `This is a full-agent session with up to ${DEFAULT_DEEP_REPLY_LIMIT} follow-ups after this response. You have all built-in Claude Code tools and may make real workspace changes needed for the task.`;
-  const turns = mode === "unlimited" ? optionalMaxTurns(args, PHASES.full) : maxTurns(args, PHASES.full);
+  enforceSerialInferenceInvariant();
+  const modePrompt = replyLimit === null
+    ? "This full-agent session has no numerical cross-agent reply ceiling by default. You have all built-in Claude Code tools and may make user-authorized workspace changes. Continue productively until the task converges or the user stops it; do not spend ceremonial turns after convergence."
+    : `The user requested a concise or bounded full-agent collaboration with at most ${replyLimit} follow-up${replyLimit === 1 ? "" : "s"} after this response. Use built-in tools efficiently and prioritize the requested outcome.`;
+  const turns = optionalMaxTurns(args);
   let processResult;
   let parsed;
   let content;
@@ -1862,7 +2067,6 @@ async function claudeFull(args, progressToken, operationId, mode = "deep") {
       cwd,
       input: prompt,
       operationId,
-      timeoutMs: PHASES.full.timeoutMs,
       progressToken,
       environmentOverrides: { CLAUDE_CODE_SUBAGENT_MODEL: model },
     });
@@ -1879,9 +2083,9 @@ async function claudeFull(args, progressToken, operationId, mode = "deep") {
     reviewMode: mode,
     sessionMode: mode,
     sessionKind: "full",
-    replyLimit: mode === "unlimited" ? null : DEFAULT_DEEP_REPLY_LIMIT,
+    replyLimit,
     repliesUsed: 0,
-    repliesRemaining: mode === "unlimited" ? null : DEFAULT_DEEP_REPLY_LIMIT,
+    repliesRemaining: replyLimit,
     canReply: false,
     nextReplyNumber: null,
     sessionState: "unavailable",
@@ -1898,12 +2102,14 @@ async function claudeFull(args, progressToken, operationId, mode = "deep") {
       model,
       effort,
       fallbackModels,
-      replyLimit: mode === "unlimited" ? null : DEFAULT_DEEP_REPLY_LIMIT,
+      replyLimit,
       replies: 0,
+      inFlight: false,
       createdAt: now,
       lastActivityAt: now,
     };
     sessions.set(sessionHandle, session);
+    persistSessions();
     policy = sessionPolicy(session);
   }
   return {
@@ -1920,7 +2126,6 @@ async function claudeFull(args, progressToken, operationId, mode = "deep") {
 }
 
 async function claudeFullReply(args, progressToken, operationId) {
-  purgeSessions();
   const handle = requireString(args, "sessionHandle", 64);
   const session = sessions.get(handle);
   if (!session) {
@@ -1931,8 +2136,8 @@ async function claudeFullReply(args, progressToken, operationId) {
   }
   if (session.replyLimit !== null && session.replies >= session.replyLimit) {
     throw new Error(
-      `This full session already used all ${session.replyLimit} default follow-ups. ` +
-      "Start another session, or explicitly request claude_full_unlimited."
+      `This full session already used all ${session.replyLimit} requested follow-ups. ` +
+      "Start a new unlimited-by-default session or choose a larger maxFollowUps value."
     );
   }
   const nextReply = session.replies + 1;
@@ -1946,14 +2151,16 @@ async function claudeFullReply(args, progressToken, operationId) {
   const cwd = canonicalDirectory(session.cwd);
   const binary = resolveClaudeBinary();
   requireSubscriptionAuth(binary);
-  enforceInferenceLimit();
+  enforceSerialInferenceInvariant();
   session.lastActivityAt = Date.now();
+  session.inFlight = true;
+  persistSessions();
   const isFinalDeepReply = session.replyLimit !== null && nextReply === session.replyLimit;
   const replyPrompt = session.mode === "unlimited"
-    ? `This is full-agent uncapped continuation ${nextReply}. Use all built-in tools needed for the newest instruction and keep reporting concrete changes and verification.`
+    ? `This is full-agent continuation ${nextReply} in the default unlimited session. Use all built-in tools needed for the newest instruction and keep reporting concrete changes and verification.`
     : isFinalDeepReply
-      ? `This is full-agent continuation ${nextReply} of ${session.replyLimit}, the final default follow-up. Finish the strongest remaining implementation or verification work and give Codex a precise handoff.`
-      : `This is full-agent continuation ${nextReply} of ${session.replyLimit}. Continue the task using built-in tools as needed and address Codex's newest evidence or instruction.`;
+      ? `This is full-agent bounded continuation ${nextReply} of ${session.replyLimit}, the final requested follow-up. Finish the strongest remaining implementation or verification work and give Codex a precise handoff.`
+      : `This is full-agent bounded continuation ${nextReply} of ${session.replyLimit}. Continue the task using built-in tools as needed and address Codex's newest evidence or instruction.`;
   let processResult;
   let parsed;
   let content;
@@ -1961,7 +2168,7 @@ async function claudeFullReply(args, progressToken, operationId) {
     processResult = await runProcess({
       binary,
       args: fullClaudeArguments(
-        session.mode === "unlimited" ? optionalMaxTurns(args, PHASES.full) : maxTurns(args, PHASES.full),
+        optionalMaxTurns(args),
         session.claudeSessionId,
         replyPrompt,
         session.model,
@@ -1971,13 +2178,13 @@ async function claudeFullReply(args, progressToken, operationId) {
       cwd,
       input: prompt,
       operationId,
-      timeoutMs: PHASES.full.timeoutMs,
       progressToken,
       environmentOverrides: { CLAUDE_CODE_SUBAGENT_MODEL: session.model },
     });
     ({ parsed, content } = parseClaudeResult(processResult));
   } catch (error) {
     sessions.delete(handle);
+    persistSessions();
     throw fullAgentFailure(
       annotateInvocationError(error, session.model, session.effort, session.fallbackModels, processResult),
       "The full Claude session was closed because its continuation state is now ambiguous."
@@ -1986,6 +2193,7 @@ async function claudeFullReply(args, progressToken, operationId) {
   const resumedSessionId = parsed.session_id || parsed.sessionId;
   if (!isSafeClaudeSessionId(resumedSessionId) || resumedSessionId !== session.claudeSessionId) {
     sessions.delete(handle);
+    persistSessions();
     const mismatch = new Error("Claude returned a missing or different session identity while resuming; the full session was closed.");
     mismatch.failureKind = "session_identity_mismatch";
     throw fullAgentFailure(
@@ -1995,6 +2203,8 @@ async function claudeFullReply(args, progressToken, operationId) {
   }
   session.replies = nextReply;
   session.lastActivityAt = Date.now();
+  session.inFlight = false;
+  persistSessions();
   return {
     status: "done",
     workspaceAccess: "full-built-in",
@@ -2017,7 +2227,7 @@ async function claudeImplement(args, progressToken, operationId) {
   const binary = resolveClaudeBinary();
   requireSubscriptionAuth(binary);
   const authorization = validateImplementWorktree(cwd);
-  enforceInferenceLimit();
+  enforceSerialInferenceInvariant();
   // Consume the capability before spawning. A failed or cancelled run requires deliberate reauthorization.
   unlinkSync(authorization.markerPath);
   const scopePrompt =
@@ -2033,7 +2243,7 @@ async function claudeImplement(args, progressToken, operationId) {
       binary,
       args: claudeArguments(
         PHASES.implement,
-        maxTurns(args, PHASES.implement),
+        optionalMaxTurns(args),
         null,
         scopePrompt,
         authorization.allowedPaths,
@@ -2044,7 +2254,6 @@ async function claudeImplement(args, progressToken, operationId) {
       cwd,
       input: prompt,
       operationId,
-      timeoutMs: PHASES.implement.timeoutMs,
       progressToken,
     });
     const parsedResult = parseClaudeResult(processResult);
@@ -2154,31 +2363,41 @@ async function claudeStatus() {
       "requestedModel/requestedEffort are launch settings; modelsUsed/modelUsage are aggregate model evidence. Effective effort and a single primary model are not reliably emitted in JSON mode.",
   };
   const reviewPolicy = {
-    defaultMode: "deep",
-    defaultReplyLimit: DEFAULT_DEEP_REPLY_LIMIT,
+    defaultMode: "unlimited",
+    defaultReplyLimit: null,
     unlimitedModeAvailable: true,
-    unlimitedRequiresExplicitUserRequest: true,
-    sessionIdleTimeoutMinutes: SESSION_IDLE_TTL_MS / 60_000,
-    defaultTurnsPerClaudeCall: PHASES.plan.defaultTurns,
-    maximumTurnsPerClaudeCall: PHASES.plan.maxTurns,
+    conciseModeAvailableWithMaxFollowUps: true,
+    sessionIdleTimeout: null,
+    idleDisconnectPolicy: "never",
+    explicitSessionCloseTool: "claude_session_close",
+    defaultTurnsPerClaudeCall: null,
+    maximumTurnsPerClaudeCall: null,
+    bridgeWallClockTimeout: null,
+    operationPollingTool: "claude_operation",
+    explicitCancellationTool: "claude_operation_cancel",
   };
   const fullAgentPolicy = {
     available: true,
     proactiveInvocationAllowed: true,
     permissionMode: PHASES.full.permissionMode,
     tools: PHASES.full.tools,
-    defaultReplyLimit: DEFAULT_DEEP_REPLY_LIMIT,
+    defaultReplyLimit: null,
     unlimitedModeAvailable: true,
-    unlimitedRequiresExplicitUserRequest: true,
+    conciseModeAvailableWithMaxFollowUps: true,
     defaultModel: DEFAULT_MODEL,
     defaultEffort: DEFAULT_EFFORT,
     supportedModelOptions: FULL_MODEL_OPTIONS,
     defaultAvailabilityFallbackModels: defaultFallbackModels(DEFAULT_MODEL),
     fallbackCanBeDisabledWithEmptyArray: true,
     subagentModelPinnedToRequestedSelector: true,
-    defaultInternalTurnLimit: PHASES.full.defaultTurns,
-    maximumExplicitTurnsPerCall: PHASES.full.maxTurns,
-    timeoutMinutesPerCall: PHASES.full.timeoutMs / 60_000,
+    defaultInternalTurnLimit: null,
+    maximumExplicitTurnsPerCall: null,
+    bridgeWallClockTimeout: null,
+    sessionIdleTimeout: null,
+    idleDisconnectPolicy: "never",
+    explicitSessionCloseTool: "claude_session_close",
+    operationPollingTool: "claude_operation",
+    explicitCancellationTool: "claude_operation_cancel",
   };
   const conflicts = billedAuthConflicts();
   let allowedRoots = [];
@@ -2262,7 +2481,7 @@ async function claudeStatus() {
           rootPolicyReport.allowAllRoots
             ? "in any existing directory because workspace-root restriction is turned off by the persistent operator policy"
             : "in the approved workspace roots"
-        }. Default policy: Fable at max effort, with Opus then Sonnet availability fallback; every inference reports requested settings and aggregate observed model evidence.`
+        }. Default policy: unlimited cross-agent follow-ups, Fable at max effort, with Opus then Sonnet availability fallback; maxFollowUps is used only for an explicitly concise or bounded request.`
       : conflicts.length > 0
         ? `Calls are refused because billing or provider variables are present: ${conflicts.join(", ")}.`
         : !auth.recognized
@@ -2271,26 +2490,259 @@ async function claudeStatus() {
   };
 }
 
-async function handleToolCall(name, args, progressToken, operationId) {
+const CLAUDE_INFERENCE_TOOLS = new Set([
+  "claude_plan",
+  "claude_plan_unlimited",
+  "claude_reply",
+  "claude_implement",
+  "claude_full",
+  "claude_full_unlimited",
+  "claude_full_reply",
+]);
+
+async function executeClaudeInference(name, args, operationId) {
   switch (name) {
     case "claude_plan":
-      return toolResult(await claudePlan(args, progressToken, operationId, "deep"));
+      return claudePlan(args, undefined, operationId, false);
     case "claude_plan_unlimited":
-      return toolResult(await claudePlan(args, progressToken, operationId, "unlimited"));
+      return claudePlan(args, undefined, operationId, true);
     case "claude_reply":
-      return toolResult(await claudeReply(args, progressToken, operationId));
-    case "claude_implement": {
-      const result = await claudeImplement(args, progressToken, operationId);
-      return toolResult(result, result.status !== "done");
-    }
+      return claudeReply(args, undefined, operationId);
+    case "claude_implement":
+      return claudeImplement(args, undefined, operationId);
     case "claude_full":
-      return toolResult(await claudeFull(args, progressToken, operationId, "deep"));
+      return claudeFull(args, undefined, operationId, false);
     case "claude_full_unlimited":
-      return toolResult(await claudeFull(args, progressToken, operationId, "unlimited"));
+      return claudeFull(args, undefined, operationId, true);
     case "claude_full_reply":
-      return toolResult(await claudeFullReply(args, progressToken, operationId));
+      return claudeFullReply(args, undefined, operationId);
+    default:
+      throw new Error(`Unknown Claude inference tool: ${name}`);
+  }
+}
+
+function operationMetadata(operation) {
+  const startedAtMs = operation.startedAt === null ? null : Date.parse(operation.startedAt);
+  const completedAtMs = operation.completedAt === null ? null : Date.parse(operation.completedAt);
+  return {
+    operationHandle: operation.handle,
+    operationKind: operation.tool,
+    status: operation.status,
+    createdAt: operation.createdAt,
+    startedAt: operation.startedAt,
+    completedAt: operation.completedAt,
+    elapsedMs:
+      startedAtMs === null || Number.isNaN(startedAtMs)
+        ? null
+        : Math.max(0, (completedAtMs === null || Number.isNaN(completedAtMs) ? Date.now() : completedAtMs) - startedAtMs),
+    targetSessionHandle: operation.targetSessionHandle,
+    cancelRequested: operation.cancelRequested,
+    bridgeWallClockTimeout: null,
+    idleDisconnectPolicy: "never",
+  };
+}
+
+function operationView(operation, includeResult = true) {
+  const metadata = operationMetadata(operation);
+  if (!includeResult || operation.status === "queued" || operation.status === "running") {
+    return {
+      ...metadata,
+      pollWith: "claude_operation",
+      cancelWith: "claude_operation_cancel",
+      content:
+        operation.status === "running"
+          ? `Claude operation ${operation.handle} is still running. No bridge wall-clock timeout or idle disconnect is active.`
+          : operation.status === "queued"
+            ? `Claude operation ${operation.handle} is queued behind earlier work. It will wait without a bridge timeout.`
+            : `Claude operation ${operation.handle} is ${operation.status}.`,
+    };
+  }
+  if (operation.status === "completed") {
+    return {
+      ...metadata,
+      result: operation.result,
+      content: operation.result?.content || `Claude operation ${operation.handle} completed.`,
+    };
+  }
+  return {
+    ...metadata,
+    error: operation.error,
+    content: operation.error?.content || `Claude operation ${operation.handle} ${operation.status}.`,
+  };
+}
+
+function operationError(error) {
+  const workspaceMayContainPartialChanges = error?.workspaceMayContainPartialChanges === true;
+  return {
+    status: "error",
+    content: redact(error?.message || error, 8000),
+    ...invocationMetadata(error),
+    ...(workspaceMayContainPartialChanges
+      ? { workspaceMayContainPartialChanges: true, automaticRollbackPerformed: false, inspectionRequired: true }
+      : {}),
+  };
+}
+
+function queueClaudeOperation(name, args) {
+  const handle = randomUUID();
+  const operation = {
+    handle,
+    tool: name,
+    status: "queued",
+    createdAt: new Date().toISOString(),
+    startedAt: null,
+    completedAt: null,
+    targetSessionHandle: typeof args.sessionHandle === "string" ? args.sessionHandle : null,
+    cancelRequested: false,
+    result: null,
+    error: null,
+    promise: null,
+  };
+  operations.set(handle, operation);
+
+  const run = async () => {
+    if (operation.cancelRequested) return;
+    operation.status = "running";
+    operation.startedAt = new Date().toISOString();
+    try {
+      operation.result = await executeClaudeInference(name, args, handle);
+      operation.status = "completed";
+    } catch (error) {
+      operation.error = operationError(error);
+      operation.status = operation.cancelRequested ? "cancelled" : "error";
+    } finally {
+      operation.completedAt = new Date().toISOString();
+    }
+  };
+
+  const promise = operationQueueTail.catch(() => {}).then(run);
+  operation.promise = promise;
+  operationQueueTail = promise.catch(() => {});
+  return {
+    status: "queued",
+    operationHandle: handle,
+    operationKind: name,
+    createdAt: operation.createdAt,
+    bridgeWallClockTimeout: null,
+    idleDisconnectPolicy: "never",
+    pollWith: "claude_operation",
+    cancelWith: "claude_operation_cancel",
+    content:
+      `Claude operation ${handle} was accepted and will continue independently of this client request. ` +
+      "Poll claude_operation until it completes; use claude_operation_cancel only for an explicit cancellation.",
+  };
+}
+
+function inspectClaudeOperation(args) {
+  if (args.operationHandle !== undefined) {
+    const operation = operations.get(args.operationHandle);
+    if (!operation) throw new Error("operationHandle is unknown to this running bridge process.");
+    return operationView(operation, true);
+  }
+  const listed = [...operations.values()]
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+    .map((operation) => operationMetadata(operation));
+  return {
+    status: "ready",
+    operations: listed,
+    count: listed.length,
+    bridgeWallClockTimeout: null,
+    idleDisconnectPolicy: "never",
+    content: `This bridge process knows ${listed.length} Claude operation${listed.length === 1 ? "" : "s"}.`,
+  };
+}
+
+function cancelClaudeOperation(args) {
+  const operation = operations.get(args.operationHandle);
+  if (!operation) throw new Error("operationHandle is unknown to this running bridge process.");
+  if (["completed", "error", "cancelled"].includes(operation.status)) {
+    return {
+      ...operationMetadata(operation),
+      content: `Claude operation ${operation.handle} is already ${operation.status}; no process was terminated.`,
+    };
+  }
+  operation.cancelRequested = true;
+  if (operation.status === "queued") {
+    operation.status = "cancelled";
+    operation.completedAt = new Date().toISOString();
+  } else {
+    const control = active.get(operation.handle);
+    control?.cancel(new Error("Claude operation was explicitly cancelled through claude_operation_cancel."));
+  }
+  return {
+    ...operationMetadata(operation),
+    content:
+      operation.status === "cancelled"
+        ? `Queued Claude operation ${operation.handle} was explicitly cancelled before it started.`
+        : `Cancellation was explicitly requested for running Claude operation ${operation.handle}. Poll claude_operation for terminal state.`,
+  };
+}
+
+function listClaudeSessions() {
+  const listed = [...sessions.entries()]
+    .map(([sessionHandle, session]) => ({
+      sessionHandle,
+      cwd: session.cwd,
+      createdAt: new Date(session.createdAt).toISOString(),
+      lastActivityAt: new Date(session.lastActivityAt).toISOString(),
+      ...sessionPolicy(session),
+    }))
+    .sort((left, right) => right.lastActivityAt.localeCompare(left.lastActivityAt));
+  return {
+    status: "ready",
+    sessions: listed,
+    count: listed.length,
+    persistencePath: SESSION_STATE_PATH,
+    persistenceError: sessionPersistenceError,
+    content:
+      `${listed.length} Claude peer session${listed.length === 1 ? " is" : "s are"} open. ` +
+      "Idle sessions never expire; close one only with claude_session_close.",
+  };
+}
+
+function closeClaudeSession(args) {
+  const handle = args.sessionHandle;
+  const session = sessions.get(handle);
+  if (!session) throw new Error("sessionHandle is unknown or already closed.");
+  const usingOperation = [...operations.values()].find(
+    (operation) => operation.targetSessionHandle === handle && ["queued", "running"].includes(operation.status)
+  );
+  if (usingOperation) {
+    throw new Error(
+      `Session ${handle} is being used by ${usingOperation.tool} operation ${usingOperation.handle}; ` +
+      "cancel that operation explicitly and wait for terminal state before closing the session."
+    );
+  }
+  sessions.delete(handle);
+  persistSessions();
+  return {
+    status: "closed",
+    sessionHandle: handle,
+    sessionKind: session.kind,
+    closedAt: new Date().toISOString(),
+    content: `Claude peer session ${handle} was explicitly closed.`,
+  };
+}
+
+async function handleToolCall(name, args, progressToken, requestOperationId) {
+  if (CLAUDE_INFERENCE_TOOLS.has(name)) return toolResult(queueClaudeOperation(name, args));
+  switch (name) {
     case "claude_status":
       return toolResult(await claudeStatus());
+    case "claude_capabilities":
+      return toolResult(claudeCapabilities(args));
+    case "claude_operation": {
+      const result = inspectClaudeOperation(args);
+      const failed = ["error", "cancelled"].includes(result.status) ||
+        (result.status === "completed" && result.result?.status && result.result.status !== "done");
+      return toolResult(result, failed);
+    }
+    case "claude_operation_cancel":
+      return toolResult(cancelClaudeOperation(args));
+    case "claude_sessions":
+      return toolResult(listClaudeSessions());
+    case "claude_session_close":
+      return toolResult(closeClaudeSession(args));
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -2311,7 +2763,7 @@ async function handleRequest(message) {
         protocolVersion: SUPPORTED_PROTOCOL_VERSIONS.has(params?.protocolVersion) ? params.protocolVersion : PROTOCOL_VERSION,
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-        instructions: `Claude may be invoked proactively whenever it materially improves the user's in-scope task. New sessions default to Fable at max effort with ordered Opus/Sonnet availability fallback, unless the user selects another policy. Inspect each result's modelVerification, modelsUsed/modelUsage, and effortVerification; never retry a refusal to evade safeguards. Use claude_full for a persistent full built-in Claude Code agent that can edit files and run commands in ${rootScopeWording().agentScope}; use read-only review tools when mutation is not authorized. While a Claude inference is in flight, preserve it when the user asks a quick side question through Codex's /btw command; answer the aside without cancelling or steering the original work, then continue waiting for its result. Unlimited reply count still requires the dedicated explicit-consent tool.`,
+        instructions: `Claude may be invoked proactively whenever it materially improves the user's in-scope task. New sessions default to unlimited cross-agent follow-ups, Fable at max effort, and ordered Opus/Sonnet availability fallback. Set maxFollowUps only when the top-level user asks for concise, bounded, or an exact number of rounds. Inference tools return an operation handle immediately: poll claude_operation until terminal state, and use claude_operation_cancel only after an explicit cancellation request. The bridge applies no wall-clock timeout and never expires idle sessions; claude_session_close is the explicit disconnect path. Inspect modelVerification, modelsUsed/modelUsage, and effortVerification; never retry a refusal to evade safeguards. Use claude_capabilities to query the versioned Claude/Codex control catalog and honor each entry's access route—known terminal UI commands are not automatically MCP tools. Use claude_full for a persistent full built-in Claude Code agent that can edit files and run commands in ${rootScopeWording().agentScope}; use read-only review when mutation is not authorized. During a Codex /btw side question, preserve the in-flight Claude inference and answer the aside without cancelling or steering the original work.`,
       },
     };
   }
@@ -2358,7 +2810,9 @@ async function handleRequest(message) {
 }
 
 function terminateAll() {
-  for (const child of active.values()) terminateProcessTree(child);
+  for (const control of active.values()) {
+    control.cancel(new Error("The Claude bridge host is shutting down; the active operation cannot remain attached."));
+  }
 }
 
 process.stdout.on("error", () => {
@@ -2390,6 +2844,8 @@ process.on("unhandledRejection", (error) => {
   }
 });
 
+loadPersistedSessions();
+
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 
 input.on("line", (line) => {
@@ -2408,7 +2864,10 @@ input.on("line", (line) => {
 
   if (message.method === "notifications/cancelled") {
     const operationId = requestOperations.get(JSON.stringify(message.params?.requestId));
-    if (operationId) terminateProcessTree(active.get(operationId));
+    if (operationId) {
+      const control = active.get(operationId);
+      control?.cancel(new Error("The MCP client explicitly cancelled this synchronous bridge request."));
+    }
     return;
   }
   if (message.method === "notifications/initialized") {

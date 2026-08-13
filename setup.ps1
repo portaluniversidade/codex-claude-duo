@@ -242,7 +242,8 @@ function Get-RawSha256 {
 function Test-PluginCacheMatches {
     param(
         [Parameter(Mandatory = $true)][string]$SourceRoot,
-        [Parameter(Mandatory = $true)][string]$CacheRoot
+        [Parameter(Mandatory = $true)][string]$CacheRoot,
+        [switch]$AllowAdditionalCacheFiles
     )
 
     if (-not [System.IO.Directory]::Exists($SourceRoot) -or -not [System.IO.Directory]::Exists($CacheRoot)) {
@@ -252,7 +253,7 @@ function Test-PluginCacheMatches {
     $cacheFiles = @([System.IO.Directory]::EnumerateFiles($CacheRoot, '*', [System.IO.SearchOption]::AllDirectories))
     $sourceRelative = @($sourceFiles | ForEach-Object { $_.Substring($SourceRoot.Length + 1) })
     $cacheRelative = @($cacheFiles | ForEach-Object { $_.Substring($CacheRoot.Length + 1) })
-    if ($sourceRelative.Count -ne $cacheRelative.Count) { return $false }
+    if (-not $AllowAdditionalCacheFiles -and $sourceRelative.Count -ne $cacheRelative.Count) { return $false }
     foreach ($relativePath in $sourceRelative) {
         if ($relativePath -notin $cacheRelative) { return $false }
         $sourcePath = [System.IO.Path]::Combine($SourceRoot, $relativePath)
@@ -359,6 +360,13 @@ if ($InstallClaudePlugin) {
 
     $marketplaceName = 'codex-claude-duo'
     $pluginId = "codex-peer@$marketplaceName"
+    $pluginSource = [System.IO.Path]::Combine($BundleRoot, 'claude-plugins', 'codex-peer')
+    $pluginManifestPath = [System.IO.Path]::Combine($pluginSource, '.claude-plugin', 'plugin.json')
+    try {
+        $expectedVersion = (Get-Content -Raw -LiteralPath $pluginManifestPath | ConvertFrom-Json).version
+    } catch {
+        throw "Could not read the codex-peer plugin version from '$pluginManifestPath'."
+    }
     $canonicalBundle = Get-NormalizedExistingPath -Path $BundleRoot
     $marketplaces = Get-ClaudeMarketplaces -ClaudeBinary $claude
     $registration = @($marketplaces | Where-Object { $_.name -eq $marketplaceName }) | Select-Object -First 1
@@ -392,7 +400,22 @@ if ($InstallClaudePlugin) {
         $_.id -eq $pluginId -and $_.scope -eq 'user' -and $_.enabled
     }) | Select-Object -First 1
     if (-not $selected) { throw 'Claude Code reported installation success, but the reciprocal codex-peer plugin is not enabled at user scope.' }
-    Write-Host "Installed and verified Claude Code plugin $($selected.id) $($selected.version)."
+    $expectedCacheRoot = [System.IO.Path]::Combine(
+        $env:USERPROFILE, '.claude', 'plugins', 'cache', $marketplaceName, 'codex-peer', $expectedVersion
+    )
+    $selectedCacheRoot = if ($selected.installPath) { Get-NormalizedExistingPath -Path $selected.installPath } else { $null }
+    $normalizedExpectedCacheRoot = if ([System.IO.Directory]::Exists($expectedCacheRoot)) {
+        Get-NormalizedExistingPath -Path $expectedCacheRoot
+    } else {
+        $expectedCacheRoot
+    }
+    $postconditionVerified = $selected.version -eq $expectedVersion -and $selectedCacheRoot -and
+        $selectedCacheRoot.Equals($normalizedExpectedCacheRoot, [System.StringComparison]::OrdinalIgnoreCase) -and
+        (Test-PluginCacheMatches -SourceRoot $pluginSource -CacheRoot $expectedCacheRoot -AllowAdditionalCacheFiles)
+    if (-not $postconditionVerified) {
+        throw "Claude Code plugin installation did not reach a byte-verified $expectedVersion cache state at '$expectedCacheRoot'."
+    }
+    Write-Host "Installed and byte-verified every codex-peer $expectedVersion payload file, including assets/control-catalog.json."
 }
 
 $billingVariables = @(

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -98,6 +98,22 @@ async function readySession(environmentOverrides) {
   return server;
 }
 
+let nextOperationRequestId = 20_000;
+async function terminalOperation(server, queued, timeoutMs = 30_000) {
+  assert.equal(queued.status, "queued");
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const response = await server.request(nextOperationRequestId++, "tools/call", {
+      name: "claude_operation",
+      arguments: { operationHandle: queued.operationHandle },
+    });
+    const result = response.result.structuredContent;
+    if (["completed", "error", "cancelled"].includes(result.status)) return result;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Operation ${queued.operationHandle} did not reach terminal state.`);
+}
+
 function temporaryTree(t) {
   const root = mkdtempSync(path.join(tmpdir(), "claude-peer-root-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -113,7 +129,7 @@ async function planIn(server, id, cwd) {
     name: "claude_plan",
     arguments: { prompt: "root policy probe; no inference is expected to start", cwd },
   });
-  return response.result.structuredContent;
+  return terminalOperation(server, response.result.structuredContent);
 }
 
 test("restricted mode still refuses a directory outside the configured roots", async (t) => {
@@ -180,15 +196,17 @@ test("claude_full without cwd and claude_implement also honor the persistent pol
     name: "claude_full",
     arguments: { prompt: "root policy probe; no inference is expected to start", cwd: tree.outside },
   });
-  assert.match(explicitCwd.result.structuredContent.content, OVERRIDE_REJECTED);
+  const explicitCwdResult = await terminalOperation(server, explicitCwd.result.structuredContent);
+  assert.match(explicitCwdResult.content, OVERRIDE_REJECTED);
 
   const implement = await server.request(3, "tools/call", {
     name: "claude_implement",
     arguments: { prompt: "root policy probe; no inference is expected to start", cwd: tree.outside },
   });
+  const implementResult = await terminalOperation(server, implement.result.structuredContent);
   // claude_implement keeps its own worktree authorization gate after the root check is satisfied.
   assert.match(
-    implement.result.structuredContent.content,
+    implementResult.content,
     /CLAUDE_PEER_CLAUDE_BIN was set|linked Git worktree|write authorization/i
   );
 });
@@ -248,4 +266,52 @@ test("a malformed policy file fails loud instead of silently changing the policy
   assert.equal(status.rootPolicy.mode, "misconfigured");
   assert.equal(status.allowedRootsConfigured, false);
   assert.match(status.rootPolicy.error, /not valid JSON/i);
+});
+
+test("idle Claude sessions persist across bridge restarts until explicitly closed", async (t) => {
+  const tree = temporaryTree(t);
+  const stateRoot = path.join(tree.root, "state");
+  mkdirSync(stateRoot);
+  const sessionHandle = "11111111-1111-4111-8111-111111111111";
+  const sessionStatePath = path.join(stateRoot, "claude-peer-sessions.json");
+  writeFileSync(sessionStatePath, JSON.stringify({
+    schemaVersion: 1,
+    updatedAt: new Date().toISOString(),
+    sessions: [{
+      handle: sessionHandle,
+      kind: "review",
+      claudeSessionId: "22222222-2222-4222-8222-222222222222",
+      cwd: bundleRoot,
+      mode: "unlimited",
+      model: "fable",
+      effort: "max",
+      fallbackModels: ["opus", "sonnet"],
+      replyLimit: null,
+      replies: 0,
+      inFlight: false,
+      createdAt: Date.now() - 365 * 24 * 60 * 60 * 1000,
+      lastActivityAt: Date.now() - 365 * 24 * 60 * 60 * 1000,
+    }],
+  }, null, 2), "utf8");
+
+  const first = await readySession({ CLAUDE_PEER_STATE_DIR: stateRoot, CLAUDE_PEER_CONFIG: tree.configPath });
+  const listed = await first.request(2, "tools/call", { name: "claude_sessions", arguments: {} });
+  assert.equal(listed.result.structuredContent.count, 1);
+  assert.equal(listed.result.structuredContent.sessions[0].sessionHandle, sessionHandle);
+  assert.equal(listed.result.structuredContent.sessions[0].idleExpiresAt, null);
+  assert.equal(listed.result.structuredContent.sessions[0].idleDisconnectPolicy, "never");
+
+  const closed = await first.request(3, "tools/call", {
+    name: "claude_session_close",
+    arguments: { sessionHandle },
+  });
+  assert.equal(closed.result.structuredContent.status, "closed");
+  await first.close();
+
+  const second = await readySession({ CLAUDE_PEER_STATE_DIR: stateRoot, CLAUDE_PEER_CONFIG: tree.configPath });
+  t.after(() => second.close());
+  const afterRestart = await second.request(2, "tools/call", { name: "claude_sessions", arguments: {} });
+  assert.equal(afterRestart.result.structuredContent.count, 0);
+  const persisted = JSON.parse(readFileSync(sessionStatePath, "utf8"));
+  assert.deepEqual(persisted.sessions, []);
 });
