@@ -1563,11 +1563,6 @@ function claudeArguments(
 ) {
   const args = [
     "-p",
-    "--safe-mode",
-    "--setting-sources",
-    "",
-    "--strict-mcp-config",
-    "--no-chrome",
     "--output-format",
     "json",
     "--permission-mode",
@@ -1587,11 +1582,6 @@ function claudeArguments(
 function fullClaudeArguments(turns, resumeSessionId, extraPrompt, model, effort, fallbackModels) {
   const args = [
     "-p",
-    "--safe-mode",
-    "--setting-sources",
-    "",
-    "--strict-mcp-config",
-    "--no-chrome",
     "--output-format",
     "json",
     "--permission-mode",
@@ -2399,6 +2389,14 @@ async function claudeStatus() {
     operationPollingTool: "claude_operation",
     explicitCancellationTool: "claude_operation_cancel",
   };
+  const runtimeConfiguration = {
+    safeMode: false,
+    settingSources: "normal/user-project-local",
+    strictMcpConfig: false,
+    chromeIntegration: "operator-configured",
+    pluginsAndMcpNotDisabledByBridge: true,
+    normalConfigurationLaunchPolicy: true,
+  };
   const conflicts = billedAuthConflicts();
   let allowedRoots = [];
   let rootConfigurationError = null;
@@ -2420,9 +2418,9 @@ async function claudeStatus() {
     unaffectedSafeguards: [
       "first-party Claude Max OAuth verification",
       "billing and provider environment-variable refusal",
-      "sensitive-path Read/Edit/Write denials",
+      "sensitive direct Read/Edit/Write denials (not plugin/MCP/hook containment)",
       "claude_implement one-use worktree authorization and audit",
-      "secret redaction of all returned content",
+      "secret redaction of bridge-returned content (not plugin/MCP/hook containment)",
     ],
     error: rootConfigurationError,
   };
@@ -2442,6 +2440,7 @@ async function claudeStatus() {
       billingOverrideVariables: conflicts,
       reviewPolicy,
       fullAgentPolicy,
+      runtimeConfiguration,
       modelSelection,
       defaultWorkspace: DEFAULT_WORKSPACE_ROOT,
       defaultWorkspaceExists: existsSync(DEFAULT_WORKSPACE_ROOT),
@@ -2472,6 +2471,7 @@ async function claudeStatus() {
     billingOverrideVariables: conflicts,
     reviewPolicy,
     fullAgentPolicy,
+    runtimeConfiguration,
     modelSelection,
     defaultWorkspace: DEFAULT_WORKSPACE_ROOT,
     defaultWorkspaceExists: existsSync(DEFAULT_WORKSPACE_ROOT),

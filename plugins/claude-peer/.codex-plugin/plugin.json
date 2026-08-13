@@ -1,6 +1,6 @@
 {
   "name": "claude-peer",
-  "version": "0.5.0+codex.20260813143117",
+  "version": "0.5.1+codex.20260813193000",
   "description": "Proactively collaborate with Claude Code through durable no-timeout operations and persistent idle sessions as one half of a bidirectional Codex and Claude bridge.",
   "author": {
     "name": "Portal Universidade",

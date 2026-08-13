@@ -309,15 +309,7 @@ class CodexMcpClient {
   }
 
   async start() {
-    const args = [
-      "mcp-server",
-      "--disable", "plugins",
-      "--disable", "apps",
-      "--disable", "hooks",
-      "-c", "mcp_servers={}",
-      "-c", "sandbox_workspace_write.network_access=false",
-      "-c", 'shell_environment_policy.inherit="core"',
-    ];
+    const args = ["mcp-server"];
     this.child = spawn(this.binary, args, {
       cwd: WORKSPACE_ROOT,
       env: buildChildEnvironment(),
@@ -616,7 +608,7 @@ function invocationMetadata(session, durationMs) {
     },
     sandbox: session.phase.sandbox,
     approvalPolicy: "never",
-    networkAccess: false,
+    networkAccessPolicy: "operator_configuration",
     workspace: WORKSPACE_ROOT,
     durationMs,
   };
@@ -636,7 +628,7 @@ function newToolArguments(prompt, kind, model, effort, replyLimit) {
   const phase = PHASES[kind];
   const phaseInstruction = kind === "review"
     ? "This phase is read-only. Do not modify files or external state."
-    : "This phase may make user-authorized local changes only inside the bound workspace. Network access is disabled. Report every changed file and verification command.";
+    : "This phase may make user-authorized local changes only inside the bound workspace. Network access follows the operator's Codex configuration. Report every changed file and verification command.";
   const collaborationInstruction = replyLimit === null
     ? "Cross-agent follow-ups have no numerical bridge ceiling by default. Continue productively until the task converges or the user stops it; do not spend ceremonial turns after convergence."
     : `The user requested concise or bounded collaboration with at most ${replyLimit} follow-up${replyLimit === 1 ? "" : "s"} after this response. Prioritize the strongest unresolved issue.`;
@@ -794,11 +786,12 @@ async function codexStatus() {
       sessionPersistenceError,
     },
     recursionPrevention: {
-      scope: "nested MCP, plugin, app, and hook routes",
-      pluginsDisabled: true,
-      appsDisabled: true,
-      hooksDisabled: true,
-      configuredMcpServersCleared: true,
+      scope: "coordinator-to-coordinator launches",
+      pluginsDisabled: false,
+      appsDisabled: false,
+      hooksDisabled: false,
+      configuredMcpServersCleared: false,
+      normalConfigurationNotDisabledByBridge: true,
       developerInstructionApplied: true,
       shellLaunchProhibitedByInstructionOnly: true,
     },
@@ -881,7 +874,7 @@ const TOOL_DEFINITIONS = [
   { name: "codex_plan", title: "Ask Codex for read-only review", description: "Queue a persistent read-only Codex peer with unlimited follow-ups by default in the Claude window's fixed project root. Returns an operation handle immediately; poll codex_operation.", inputSchema: startSchema(false) },
   { name: "codex_plan_unlimited", title: "Start uncapped Codex review (compatibility alias)", description: "Compatibility alias that queues an uncapped read-only session and returns an operation handle. Ordinary codex_plan sessions are already unlimited by default.", inputSchema: startSchema(true) },
   { name: "codex_reply", title: "Continue Codex review", description: "Queue a continuation of an opaque read-only Codex session and return an operation handle. Sessions never expire for idleness and are unlimited unless maxFollowUps was deliberately set.", inputSchema: replySchema() },
-  { name: "codex_full", title: "Run Codex in workspace-write", description: "Queue a persistent Codex peer with workspace-write access, network disabled, and unlimited follow-ups by default. Returns an operation handle; use only for user-authorized local changes.", inputSchema: startSchema(false) },
+  { name: "codex_full", title: "Run Codex in workspace-write", description: "Queue a persistent Codex peer with workspace-write access and the operator's configured network policy, with unlimited follow-ups by default. Returns an operation handle; use only for user-authorized local changes.", inputSchema: startSchema(false) },
   { name: "codex_full_unlimited", title: "Start uncapped Codex workspace session (compatibility alias)", description: "Compatibility alias that queues an uncapped workspace-write session and returns an operation handle. Ordinary codex_full sessions are already unlimited by default.", inputSchema: startSchema(true) },
   { name: "codex_full_reply", title: "Continue Codex workspace session", description: "Queue a continuation of an opaque workspace-write Codex session and return an operation handle. Sessions never expire for idleness and are unlimited unless maxFollowUps was deliberately set.", inputSchema: replySchema() },
   { name: "codex_status", title: "Check reciprocal Codex bridge", description: "Check the standalone Codex CLI, ChatGPT login, fixed workspace, official MCP surface, and recursion controls without starting an inference.", inputSchema: { type: "object", additionalProperties: false, properties: {} } },
@@ -1203,7 +1196,7 @@ async function handleMessage(message) {
         protocolVersion: SUPPORTED_PROTOCOL_VERSIONS.has(params?.protocolVersion) ? params.protocolVersion : PROTOCOL_VERSION,
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-        instructions: `Claude may invoke Codex proactively for an independent in-scope pass. Inference tools return an operation handle immediately: poll codex_operation until terminal state, and use codex_operation_cancel only after an explicit cancellation request. Sessions use opaque replay-protected handles, never expire for idleness, persist across bridge restarts, and allow unlimited follow-ups by default; codex_session_close is the explicit disconnect path. Set maxFollowUps only when the user asks for concise, bounded, or an exact number of rounds. The bridge pins all calls to ${WORKSPACE_ROOT}, offers read-only and workspace-write phases, and technically disables nested Codex plugins/apps/hooks/MCPs; shell-level peer launch remains prohibited by developer instruction. Use codex_capabilities to query the versioned Claude/Codex control catalog and honor each access route—known terminal UI commands are not automatically MCP tools.`,
+        instructions: `Claude may invoke Codex proactively for an independent in-scope pass. Inference tools return an operation handle immediately: poll codex_operation until terminal state, and use codex_operation_cancel only after an explicit cancellation request. Sessions use opaque replay-protected handles, never expire for idleness, persist across bridge restarts, and allow unlimited follow-ups by default; codex_session_close is the explicit disconnect path. Set maxFollowUps only when the user asks for concise, bounded, or an exact number of rounds. The bridge pins all calls to ${WORKSPACE_ROOT}, offers read-only and workspace-write phases, and loads the operator's normal Codex configuration, including configured plugins, Apps, hooks, and MCPs. Shell-level peer launch remains prohibited by developer instruction. Use codex_capabilities to query the versioned Claude/Codex control catalog and honor each access route—known terminal UI commands are not automatically MCP tools.`,
       },
     };
   }

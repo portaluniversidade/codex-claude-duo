@@ -219,6 +219,14 @@ test("claude_status reports the effective root policy and its unaffected safegua
 
   const response = await server.request(2, "tools/call", { name: "claude_status", arguments: {} });
   const status = response.result.structuredContent;
+  assert.deepEqual(status.runtimeConfiguration, {
+    safeMode: false,
+    settingSources: "normal/user-project-local",
+    strictMcpConfig: false,
+    chromeIntegration: "operator-configured",
+    pluginsAndMcpNotDisabledByBridge: true,
+    normalConfigurationLaunchPolicy: true,
+  });
   assert.equal(status.rootPolicy.allowAllRoots, true);
   assert.equal(status.rootPolicy.mode, "all-roots");
   assert.equal(status.rootPolicy.configPath, tree.configPath);
@@ -226,7 +234,7 @@ test("claude_status reports the effective root policy and its unaffected safegua
   assert.equal(status.rootPolicy.error, null);
   assert.equal(status.allowedRootsConfigured, true);
   assert.ok(status.rootPolicy.unaffectedSafeguards.some((item) => /Max OAuth/i.test(item)));
-  assert.ok(status.rootPolicy.unaffectedSafeguards.some((item) => /redaction/i.test(item)));
+  assert.ok(status.rootPolicy.unaffectedSafeguards.some((item) => /redaction.*not plugin\/MCP\/hook containment/i.test(item)));
 });
 
 test("restricted status keeps reporting the allowlist and refuses drive roots", async (t) => {

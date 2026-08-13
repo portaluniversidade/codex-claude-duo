@@ -1,6 +1,6 @@
 {
   "name": "codex-peer",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Invoke an unlimited-by-default Codex peer from Claude Code through no-timeout background operations, persistent idle sessions, and shared Claude/Codex control discovery.",
   "author": {
     "name": "Portal Universidade"

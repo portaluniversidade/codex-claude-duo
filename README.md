@@ -28,7 +28,7 @@ The full phase starts the native Claude Code CLI with:
 - selectable reasoning/workflow settings with deepest reasoning (`max`) as the default;
 - Max-subscription OAuth, not an Anthropic API key.
 
-It is “full built-in Claude Code,” not a byte-for-byte relay of the interactive terminal UI. Headless `claude -p` gives the invoked model its advertised agent tools and bundled skills, but terminal slash-command preprocessing, permission dialogs, clipboard actions, account pickers, themes, and other local UI controls are not MCP model tools. The bridge intentionally disables user/project Claude settings, custom hooks, custom MCP servers, Chrome integration, and recursive Claude/Codex launches. Those exclusions keep the two-agent bridge reproducible and prevent an unreviewed local configuration from silently changing what runs.
+It is “full built-in Claude Code,” not a byte-for-byte relay of the interactive terminal UI. Headless `claude -p` gives the invoked model its advertised agent tools and bundled skills, but terminal slash-command preprocessing, permission dialogs, clipboard actions, account pickers, and themes are not MCP model tools. The bridge loads the operator's normal user, project, and local Claude configuration, including enabled plugins, configured MCP servers, hooks, and browser integrations. Those components are therefore part of the session's trust boundary and may change the tools available to Claude. Recursive Claude/Codex launches remain prohibited by bridge policy and the injected agent instruction.
 
 Native Windows does not provide Claude Code's Linux command sandbox. The full phase can make real changes anywhere its shell credentials and OS account can reach; the workspace-root check is an orchestration boundary, not an operating-system sandbox. Use the isolated implementation phase for stronger path accounting, or run the full agent inside a VM/WSL/container if an OS boundary is required.
 
@@ -59,7 +59,7 @@ flowchart LR
 
 Codex remains the coordinator: it owns the user's scope, decides what evidence to reconcile, checks both agents' work, and gives the final answer. Claude output and repository text remain untrusted task material; neither can expand authorization to commit, push, deploy, make purchases, send messages, or contact third parties.
 
-When Claude Code is the interactive host, the relationship mirrors cleanly: Claude owns the user-facing scope and final reconciliation, while Codex acts as the independent peer. Codex-launched Claude has strict empty MCP/settings sources; Claude-launched Codex starts with plugins, apps, hooks, and configured MCP servers disabled. Those settings technically close the nested MCP/plugin/app/hook routes. Both peers also receive developer instructions forbidding shell-level relaunch of either coordinator; that shell prohibition is instruction enforcement, not an operating-system impossibility.
+When Claude Code is the interactive host, the relationship mirrors cleanly: Claude owns the user-facing scope and final reconciliation, while Codex acts as the independent peer. Both Codex-launched Claude and Claude-launched Codex use the operator's normal configuration, including enabled plugins, apps, hooks, browser integrations where supported, and configured MCP servers. These components are part of each peer session's trust boundary. Both peers receive developer instructions forbidding shell-level relaunch of either coordinator; that prohibition is instruction enforcement, not an operating-system impossibility.
 
 ## One-time setup
 
@@ -263,7 +263,7 @@ The Claude Code plugin lives under `claude-plugins/codex-peer` and wraps the off
 | `codex_plan` | Read-only independent Codex review | Unlimited follow-ups by default |
 | `codex_reply` | Continue the matching read-only session | No numerical cap unless `maxFollowUps` was set |
 | `codex_plan_unlimited` | Compatibility alias for an unlimited review | Legacy confirmation required |
-| `codex_full` | Workspace-write Codex agent with network disabled | Unlimited follow-ups by default |
+| `codex_full` | Workspace-write Codex agent with operator-configured network policy | Unlimited follow-ups by default |
 | `codex_full_reply` | Continue the matching workspace-write session | No numerical cap unless `maxFollowUps` was set |
 | `codex_full_unlimited` | Compatibility alias for an unlimited workspace session | Legacy confirmation required |
 | `codex_status` | CLI/login/workspace/MCP/recursion diagnostic | No inference |
@@ -273,7 +273,7 @@ The Claude Code plugin lives under `claude-plugins/codex-peer` and wraps the off
 | `codex_sessions` | List persistent opaque sessions | No inference |
 | `codex_session_close` | Explicitly close one idle session | No inference |
 
-No reciprocal tool accepts `cwd`: the MCP server canonicalizes `CLAUDE_PROJECT_DIR` once at startup and uses that exact root for every Codex turn. Raw Codex thread IDs never enter Claude's context; the proxy replaces them with opaque handles and monotonic reply numbers. Read-only calls pin `sandbox=read-only`; write-capable calls pin `sandbox=workspace-write`; both pin `approval-policy=never`, disable workspace-write network access, serialize inference, cap output, redact common secret formats, and close ambiguous sessions after failure. There is no bridge wall-clock timeout.
+No reciprocal tool accepts `cwd`: the MCP server canonicalizes `CLAUDE_PROJECT_DIR` once at startup and uses that exact root for every Codex turn. Raw Codex thread IDs never enter Claude's context; the proxy replaces them with opaque handles and monotonic reply numbers. Read-only calls pin `sandbox=read-only`; write-capable calls pin `sandbox=workspace-write`; both pin `approval-policy=never`, serialize inference, cap output, redact common secret formats, and close ambiguous sessions after failure. Network access follows the operator's Codex configuration and is reported as `networkAccessPolicy=operator_configuration`, not as a bridge-guaranteed boolean. There is no bridge wall-clock timeout.
 
 ### Long-running operations and persistent idle sessions
 
@@ -458,9 +458,11 @@ The bridge strips known provider/billing environment variables from child proces
 - Hosted Codex connector Apps stay enabled. The default launcher binds an ephemeral App Server to loopback, waits for the real terminal thread's live Apps-ready event, and attaches the TUI to that same connection. `-DisableApps` is explicit only; `-DirectCodex` bypasses the experimental supervisor without disabling Apps.
 - Saved OAuth remains in Claude Code's own credential store. The bridge never returns raw auth data or tokens.
 - Common `.env`, Git administration, secret/credential-named, PEM, key, Win32 device, short-alias, and alternate-data-stream paths are denied to direct Read/Edit/Write tools. The full shell can still access OS-visible files, so do not treat name filters as a sandbox.
-- `--safe-mode`, empty setting sources, strict MCP config, and no Chrome integration prevent unreviewed Claude customizations from joining the subprocess.
+- The Claude subprocess loads the operator's normal user/project/local configuration, configured MCP servers, plugins, hooks, and browser integrations. Treat every enabled component as part of the session's trust boundary; the bridge retains a sanitized environment, billing-provider conflict refusal, sensitive direct-tool path rules, serialized inferences, and injected recursion prohibition.
+- Direct-tool path denials and redaction apply only to the bridge-controlled `Read`/`Edit`/`Write` tools and text returned through the bridge. They do not sandbox, audit, or restrict configured plugins, MCP servers, hooks, browser integrations, or their own outbound channels; those components can have their own capabilities and configuration.
+- `claude_status.runtimeConfiguration` exposes the applied bridge launch policy: `safeMode=false`, `settingSources=normal/user-project-local`, `strictMcpConfig=false`, `chromeIntegration=operator-configured`, `pluginsAndMcpNotDisabledByBridge=true`, and `normalConfigurationLaunchPolicy=true`. It proves only that the bridge does not disable these surfaces; it does not prove that a particular operator component is installed, enabled, authenticated, healthy, or connected.
 - Claude inferences are serialized through an unbounded in-memory operation queue, output is bounded, and a process tree is terminated only by explicit cancellation, bridge-host shutdown, native failure, or provider failure. Clean idle sessions have no expiry and persist outside the plugin cache.
-- The reciprocal Codex bridge applies the same no-wall-timeout/no-idle-expiry operation and session lifecycle. It additionally fixes the workspace to the Claude window's project and does not expose danger-full-access.
+- The reciprocal Codex bridge applies the same no-wall-timeout/no-idle-expiry operation and session lifecycle. It fixes the workspace to the Claude window's project, does not expose danger-full-access, and loads the operator's normal Codex configuration; enabled plugins, Apps, hooks, and MCP servers are part of its trust boundary. Its workspace binding, sandbox and approval policy do not sandbox, audit, or restrict those separately configured components or their own outbound channels.
 - Full-agent changes are real and have no automatic rollback. Use a disposable branch/worktree/VM for high-risk jobs and inspect the final diff.
 
 ## Validation
@@ -475,7 +477,7 @@ claude plugin validate --strict .\claude-plugins\codex-peer
 
 The deterministic tests start the MCP server without making an inference. After Max login, opt into the authenticated routing smoke test with `CLAUDE_PEER_LIVE_SMOKE=1` and set `CLAUDE_PEER_LIVE_CWD` to an approved disposable workspace; it verifies that the default request is Fable/max with Opus/Sonnet availability fallback and requires Fable-family usage evidence.
 
-The reciprocal tests also validate the Claude plugin manifests, fixed-workspace schemas, opaque-session surface, unlimited-by-default policy, control-catalog equality and screenshot/live-probe coverage, recursion-hardening flags, and an authenticated no-inference handshake against the official Codex MCP server. Opt into its authenticated read-only inference smoke test with `CODEX_PEER_LIVE_SMOKE=1`.
+The reciprocal tests also validate the Claude plugin manifests, fixed-workspace schemas, opaque-session surface, unlimited-by-default policy, control-catalog equality and screenshot/live-probe coverage, normal-configuration launcher policy, recursion developer instructions, and an authenticated no-inference handshake against the official Codex MCP server. Opt into its authenticated read-only inference smoke test with `CODEX_PEER_LIVE_SMOKE=1`.
 
 - Node syntax (including `start-codex-with-apps.mjs`) and PowerShell 5.1 AST parsing;
 - JSON/YAML/plugin and skill validation;
@@ -488,7 +490,7 @@ The reciprocal tests also validate the Claude plugin manifests, fixed-workspace 
 - structured telemetry on success and failure, including `error_max_turns`, without claiming an observable effective effort;
 - unlimited-by-default continuation, explicit concise caps, stale retry prevention, and failure-closed handles;
 - identical versioned control catalogs, source hashes, 100/100 screenshot-command coverage, and 46/46 live headless-command coverage;
-- full-agent argv with `auto`, `default` tools, safe mode, empty settings, strict MCP, and no Chrome;
+- full-agent argv with `auto`, `default` tools, normal Claude configuration discovery, and the fixed model/effort/fallback policy;
 - read-only review and all isolated-worktree adversarial audits;
 - a fake-Claude mutation test in a disposable non-Git workspace;
 - current native Claude CLI parser compatibility without making an inference;
