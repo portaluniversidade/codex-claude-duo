@@ -5,14 +5,14 @@ description: Use a locally authenticated Claude Code agent whenever an independe
 
 # Claude Peer
 
-Use Claude as an independent collaborator while Codex remains responsible for the user's scope, verification, and final answer. A Claude process launched through this bridge must never launch Codex, Claude, or another coordinator. Strict empty MCP/settings sources technically close the nested MCP route; the shell-level prohibition is also carried in the developer prompt and remains instruction enforcement. Separately, an interactive Claude Code window may use the companion `codex-peer` plugin to start one policy-bound Codex peer.
+Use Claude as an independent collaborator while Codex remains responsible for the user's scope, verification, and final answer. A Claude process launched through this bridge must never launch Codex, Claude, or another coordinator. That prohibition is carried by the developer prompt and is instruction enforcement. The full phase exposes normal configured plugins, MCPs, hooks, and their own channels; they are not sandboxed by the bridge. Separately, an interactive Claude Code window may use the companion `codex-peer` plugin to start one policy-bound Codex peer.
 
 ## Protocol
 
 1. Invoke Claude proactively when another strong implementation or review pass would materially improve the current task. A separate Claude-specific request is not required; each call still consumes the user's Claude allowance.
 2. Call `claude_status` when installation, Max authentication, workspace roots, or billing source is uncertain. Never request or expose credentials. Its `rootPolicy` field reports the effective workspace-root mode, so read it instead of assuming an allowlist.
 3. Choose the least restrictive phase that matches the user's existing authorization:
-   - use `claude_plan` for read-only questions, review, architecture, and critique;
+   - use `claude_plan` for read-only questions, review, architecture, and critique: it retains the built-in `Read,Glob` allowlist and does not expose configured MCPs;
    - use `claude_full` for user-authorized change, build, debugging, or verification work where Claude should edit files, run commands, or use built-in network tools;
    - use `claude_implement` when the user wants the narrower one-use, path-scoped Git-worktree boundary.
 4. Every inference start or continuation returns a queued `operationHandle` immediately. Poll `claude_operation` until it reports `completed`, `error`, or `cancelled`; read the actual inference payload from `result` on completion. Do not treat the queued acknowledgement as Claude's answer.
@@ -53,9 +53,9 @@ Treat requested settings and observed evidence separately. `requestedModel` and 
 
 Claude Code handles two different fallback mechanisms. The configured `fallbackModels` chain handles availability and eligible server failures. Anthropic separately applies category-specific safety routing: Fable 5 may route flagged work to Opus 5 or Opus 4.8, and some Opus 5 refusals have no lower safety fallback. Never retry or change models to evade a safety refusal. On an error, inspect `failureKind` first; fix authentication, billing, workspace, rate, transport, request-size, or `error_max_turns` problems at their cause. A failed full-agent call may have side effects, so inspect partial changes before any retry.
 
-## Full built-in Claude agent
+## Full Claude agent with operator-configured tools
 
-`claude_full` runs Claude Code with all built-in tools in `auto` permission mode. Claude can inspect and edit files, run shell commands and tests, and use built-in web tools without routine permission prompts. If `cwd` is omitted, it uses the default workspace whose exact Windows path is `C:\Users\gui07\Desktop\‎\Notes\AI`; the invisible directory segment is U+200E LEFT-TO-RIGHT MARK.
+`claude_full` runs Claude Code in `auto` permission mode with the operator-configured tool surface. The bridge deliberately omits `--tools` for the full phase, so normal user, project, and local configuration can provide configured MCP servers, plugins, hooks, browser integrations, and built-in tools. Claude can inspect and edit files, run shell commands and tests, and use available tools without routine permission prompts. `claude_plan` and `claude_implement` retain their explicit built-in allowlists and therefore do not expose configured MCPs. The phase-specific permission mode, worktree authorization, direct sensitive-tool rules, and injected recursion prohibition remain in force; full-phase plugins, MCP servers, hooks, and browser integrations remain independently configured trust-boundary components. If `cwd` is omitted, it uses the default workspace whose exact Windows path is `C:\Users\gui07\Desktop\‎\Notes\AI`; the invisible directory segment is U+200E LEFT-TO-RIGHT MARK.
 
 Which `cwd` values are accepted depends on the operator's persistent root policy in `claude-peer-config.json`, which the bridge re-reads on every call so it survives restarts, new conversations, and plugin reinstalls. When `allowAllRoots` is on, any existing directory is accepted and the live `tools/list` description says so; otherwise `cwd` must sit inside an approved root. That setting changes filesystem scope only — Max-only authentication, billing-variable refusal, sensitive-path denials, worktree write authorization, and redaction are unchanged — and it never widens the user's own authorization for what Claude may do there.
 
@@ -78,7 +78,7 @@ Claude may make in-scope local changes under the user's existing request, but it
 
 ## Default unlimited review
 
-The read-only default has no numerical `claude_reply` cap, no default internal-turn cap, and no bridge wall-clock timeout. Continue through assumptions, repository evidence, alternatives, failure modes, implementation sequencing, verification, and the strongest remaining objection for as many productive rounds as needed. Stop when the task is trivial, Claude is blocked, the user stops or replaces the task, two consecutive replies add no material evidence, or genuine convergence is reached.
+The review default has no numerical `claude_reply` cap, no default internal-turn cap, and no bridge wall-clock timeout. Its direct tool surface remains the built-in `Read,Glob` allowlist, without configured MCPs. Continue through assumptions, repository evidence, alternatives, failure modes, implementation sequencing, verification, and the strongest remaining objection for as many productive rounds as needed. Stop when the task is trivial, Claude is blocked, the user stops or replaces the task, two consecutive replies add no material evidence, or genuine convergence is reached.
 
 ## Optional concise or bounded mode
 
@@ -90,7 +90,7 @@ Unlimited means no bridge-enforced cross-agent reply count, internal-turn cap wh
 
 ## Isolated implementation
 
-`claude_implement` is the conservative write phase. Use it only with a dedicated linked Git worktree and a one-use `claude-peer-write-ok.json` authorization created by the bundle helpers. It supplies Read/Glob/Edit/Write but no shell, restricts writes to approved relative prefixes, revalidates repository and physical-tree metadata, consumes the marker before launch, and audits every outcome.
+`claude_implement` is the conservative write phase. Use it only with a dedicated linked Git worktree and a one-use `claude-peer-write-ok.json` authorization created by the bundle helpers. It supplies the built-in `Read,Glob,Edit,Write` allowlist with no shell, does not expose configured MCPs, restricts writes to approved relative prefixes, revalidates repository and physical-tree metadata, consumes the marker before launch, and audits every outcome.
 
 Treat `audit_failed`, `execution_error`, and `scope_violation` as failures requiring human inspection. Assign disjoint files when Codex and Claude edit concurrently; otherwise alternate implementation and review.
 

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -13,10 +14,10 @@ const pluginRoot = process.env.CLAUDE_PEER_PLUGIN_ROOT
 const serverPath = path.join(pluginRoot, "scripts", "claude-peer-mcp.mjs");
 const manifest = JSON.parse(readFileSync(path.join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"));
 
-function startServer() {
+function startServer(environment = {}) {
   const child = spawn(process.execPath, [serverPath], {
     cwd: fileURLToPath(new URL("..", import.meta.url)),
-    env: process.env,
+    env: { ...process.env, ...environment },
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -74,6 +75,53 @@ function startServer() {
   return { child, close, request, send };
 }
 
+function findClaudeTranscript(sessionId) {
+  const root = path.join(homedir(), ".claude", "projects");
+  if (!existsSync(root)) return null;
+  const pending = [root];
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const candidate = path.join(directory, entry.name);
+      if (entry.isDirectory()) pending.push(candidate);
+      else if (entry.isFile() && entry.name === `${sessionId}.jsonl`) return candidate;
+    }
+  }
+  return null;
+}
+
+async function waitForClaudeTranscript(sessionId, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const transcript = findClaudeTranscript(sessionId);
+    if (transcript) return transcript;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Claude transcript for live-gate session ${sessionId} was not materialized.`);
+}
+
+function transcriptMobbinToolEvidence(transcriptPath) {
+  const entries = readFileSync(transcriptPath, "utf8")
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  const toolUseIds = new Set();
+  const successfulResultIds = new Set();
+  for (const entry of entries) {
+    const content = entry?.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block?.type === "tool_use" && block.name === "mcp__mobbin__search_screens" && typeof block.id === "string") {
+        toolUseIds.add(block.id);
+      }
+      if (block?.type === "tool_result" && typeof block.tool_use_id === "string" && block.is_error !== true) {
+        successfulResultIds.add(block.tool_use_id);
+      }
+    }
+  }
+  return [...toolUseIds].some((id) => successfulResultIds.has(id));
+}
+
 let nextOperationRequestId = 10_000;
 async function pollClaudeOperation(server, queued, timeoutMs = null) {
   assert.equal(queued.status, "queued");
@@ -93,13 +141,19 @@ async function pollClaudeOperation(server, queued, timeoutMs = null) {
 
 test("all Claude peer launch phases use the operator's normal Claude configuration", () => {
   const source = readFileSync(serverPath, "utf8");
+  const phaseDefinitions = source.slice(source.indexOf("const PHASES ="), source.indexOf("const BILLING_CONFLICT_VARIABLES"));
   const launchBuilders = source.slice(source.indexOf("function claudeArguments("), source.indexOf("function parseClaudeResult("));
+  const restrictedBuilder = source.slice(source.indexOf("function claudeArguments("), source.indexOf("function fullClaudeArguments("));
+  const fullBuilder = source.slice(source.indexOf("function fullClaudeArguments("), source.indexOf("function parseClaudeResult("));
 
   for (const disabledOption of ["--safe-mode", "--setting-sources", "--strict-mcp-config", "--no-chrome"]) {
     assert.doesNotMatch(launchBuilders, new RegExp(`"${disabledOption}"`), disabledOption);
   }
   assert.match(launchBuilders, /"--permission-mode"/);
-  assert.match(launchBuilders, /"--tools"/);
+  assert.match(restrictedBuilder, /"--tools"/, "plan and implementation must retain their direct built-in allowlists");
+  assert.match(phaseDefinitions, /Read,Glob/);
+  assert.match(phaseDefinitions, /Read,Glob,Edit,Write/);
+  assert.doesNotMatch(fullBuilder, /"--tools"/, "claude_full must not narrow the configured MCP/tool surface");
   assert.match(launchBuilders, /addModelAndEffort/);
   assert.match(launchBuilders, /"--disallowedTools"/);
 });
@@ -354,6 +408,64 @@ test(
         null,
         2
       )
+    );
+  }
+);
+
+test(
+  "authenticated live Mobbin gate discovers and calls the configured MCP tool from claude_full",
+  {
+    skip: process.env.CLAUDE_PEER_RUN_MOBBIN_LIVE_GATE !== "1",
+  },
+  async (t) => {
+    const cwd = process.env.CLAUDE_PEER_LIVE_CWD;
+    assert.ok(cwd, "CLAUDE_PEER_LIVE_CWD is required when CLAUDE_PEER_RUN_MOBBIN_LIVE_GATE=1");
+    const stateDir = mkdtempSync(path.join(tmpdir(), "claude-peer-mobbin-gate-"));
+    const server = startServer({ CLAUDE_PEER_STATE_DIR: stateDir });
+    t.after(async () => {
+      await server.close();
+      rmSync(stateDir, { recursive: true, force: true });
+    });
+
+    await server.request(20_001, "initialize", {
+      protocolVersion: "2025-06-18",
+      clientInfo: { name: "live-mobbin-mcp-gate", version: "1" },
+    });
+    server.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    const statusResponse = await server.request(20_002, "tools/call", { name: "claude_status", arguments: {} });
+    assert.equal(statusResponse.result.structuredContent.status, "ready", statusResponse.result.structuredContent.content);
+
+    const started = await server.request(
+      20_003,
+      "tools/call",
+      {
+        name: "claude_full",
+        arguments: {
+          prompt:
+            "Mobbin MCP live gate. Use ToolSearch to discover mcp__mobbin__search_screens, then invoke that exact tool once with a generic mobile-interface query. Do not inspect, create, or modify files. Reply exactly MOBBIN_LIVE_GATE: tool-call-observed only after the tool invocation returns; otherwise reply exactly MOBBIN_LIVE_GATE: failed.",
+          cwd,
+          model: "fable",
+          effort: "max",
+          fallbackModels: [],
+          maxTurns: 16,
+        },
+      },
+      15 * 60 * 1000
+    );
+    const { response, operation } = await pollClaudeOperation(server, started.result.structuredContent, 15 * 60 * 1000);
+    assert.notEqual(response.result.isError, true, JSON.stringify(operation));
+    assert.equal(operation.status, "completed");
+    const sessionHandle = operation.result.sessionHandle;
+    assert.match(sessionHandle, /^[0-9a-f-]{36}$/i);
+    const state = JSON.parse(readFileSync(path.join(stateDir, "claude-peer-sessions.json"), "utf8"));
+    const session = state.sessions.find((entry) => entry.handle === sessionHandle);
+    assert.match(session?.claudeSessionId || "", /^[0-9a-f-]{36}$/i);
+    const transcript = await waitForClaudeTranscript(session.claudeSessionId);
+    assert.equal(
+      transcriptMobbinToolEvidence(transcript),
+      true,
+      "the native Claude transcript must contain mcp__mobbin__search_screens and its successful tool_result"
     );
   }
 );

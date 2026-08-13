@@ -4,7 +4,7 @@ This bundle provides a bidirectional local collaboration bridge. Codex can bring
 
 The Codex-to-Claude direction has two deliberately different collaboration surfaces:
 
-- **Full built-in Claude agent:** Claude can inspect and edit files, run commands and tests, and use its built-in web tools in an approved workspace. This is the normal choice for user-authorized build, change, debugging, and verification work.
+- **Full Claude agent with operator-configured tools:** Claude can inspect and edit files, run commands and tests, and use configured built-in, plugin, and MCP tools in an approved workspace. This is the normal choice for user-authorized build, change, debugging, and verification work.
 - **Hardened peer modes:** read-only multi-round review and a one-use, path-scoped Git-worktree editor remain available when the narrower boundary is preferable.
 
 The default workspace is exactly:
@@ -19,7 +19,7 @@ The visually blank directory between `Desktop` and `Notes` is one `U+200E LEFT-T
 
 The full phase starts the native Claude Code CLI with:
 
-- `--tools default`, which enables all built-in Claude Code tools;
+- no `--tools` restriction in the full phase, so `claude_full` and `claude_full_reply` receive the operator-configured tool surface, including configured MCP servers and plugins;
 - `--permission-mode auto`, which lets Claude work autonomously without routine permission prompts while retaining Anthropic's background safety classifier;
 - file editing, shell execution, tests, Claude subagents, WebSearch, and WebFetch;
 - persistent opaque sessions that Codex can continue with follow-up instructions;
@@ -28,7 +28,7 @@ The full phase starts the native Claude Code CLI with:
 - selectable reasoning/workflow settings with deepest reasoning (`max`) as the default;
 - Max-subscription OAuth, not an Anthropic API key.
 
-It is “full built-in Claude Code,” not a byte-for-byte relay of the interactive terminal UI. Headless `claude -p` gives the invoked model its advertised agent tools and bundled skills, but terminal slash-command preprocessing, permission dialogs, clipboard actions, account pickers, and themes are not MCP model tools. The bridge loads the operator's normal user, project, and local Claude configuration, including enabled plugins, configured MCP servers, hooks, and browser integrations. Those components are therefore part of the session's trust boundary and may change the tools available to Claude. Recursive Claude/Codex launches remain prohibited by bridge policy and the injected agent instruction.
+It is a full Claude Code agent with the operator-configured tool surface, not a byte-for-byte relay of the interactive terminal UI. Headless `claude -p` gives the invoked model its advertised agent tools and bundled skills, but terminal slash-command preprocessing, permission dialogs, clipboard actions, account pickers, and themes are not MCP model tools. The bridge deliberately omits `--tools` only for `claude_full` and `claude_full_reply`, so the normal user, project, and local Claude configuration can provide enabled plugins, configured MCP servers, hooks, and browser integrations. The plan and isolated implementation phases retain their explicit built-in allowlists (`Read,Glob` and `Read,Glob,Edit,Write`) and therefore do not expose those configured MCPs. The phase-specific permission mode, worktree authorization, direct sensitive-tool rules, and injected recursion prohibition remain in force.
 
 Native Windows does not provide Claude Code's Linux command sandbox. The full phase can make real changes anywhere its shell credentials and OS account can reach; the workspace-root check is an orchestration boundary, not an operating-system sandbox. Use the isolated implementation phase for stronger path accounting, or run the full agent inside a VM/WSL/container if an OS boundary is required.
 
@@ -238,10 +238,10 @@ The Codex-side plugin exposes thirteen tools. Every inference tool queues work a
 
 | Tool | Capability | Default conversation budget |
 |---|---|---:|
-| `claude_full` | Full built-in tools, direct workspace writes, commands, tests, web tools | Unlimited follow-ups by default |
+| `claude_full` | Operator-configured Claude Code tools, direct workspace writes, commands, tests, web tools | Unlimited follow-ups by default |
 | `claude_full_reply` | Continue the same full session | No numerical cap unless `maxFollowUps` was set |
 | `claude_full_unlimited` | Compatibility alias for an unlimited full session | Legacy confirmation required |
-| `claude_plan` | Read-only deep review with Read/Glob | Unlimited follow-ups by default |
+| `claude_plan` | Read-only deep review with built-in `Read,Glob` allowlist; configured MCPs are unavailable in this phase | Unlimited follow-ups by default |
 | `claude_reply` | Continue a read-only review | No numerical cap unless `maxFollowUps` was set |
 | `claude_plan_unlimited` | Compatibility alias for an unlimited review | Legacy confirmation required |
 | `claude_implement` | One-use, path-scoped edits in a clean linked worktree; no shell | One implementation call |
@@ -413,7 +413,7 @@ Claude receives Read and Glob only in this phase. Codex should include diff/test
 
 For substantive build and debugging work, the skill continues past Claude's first implementation response for as many evidence-producing rounds as needed:
 
-1. Claude implements or investigates with its full built-in tools.
+1. Claude implements or investigates with its operator-configured Claude Code tool surface.
 2. Codex inspects the actual files, diff, commands, and assumptions, then sends concrete objections.
 3. Claude corrects the implementation.
 4. Claude runs or analyzes tests, failure modes, and edge cases.
@@ -460,7 +460,7 @@ The bridge strips known provider/billing environment variables from child proces
 - Common `.env`, Git administration, secret/credential-named, PEM, key, Win32 device, short-alias, and alternate-data-stream paths are denied to direct Read/Edit/Write tools. The full shell can still access OS-visible files, so do not treat name filters as a sandbox.
 - The Claude subprocess loads the operator's normal user/project/local configuration, configured MCP servers, plugins, hooks, and browser integrations. Treat every enabled component as part of the session's trust boundary; the bridge retains a sanitized environment, billing-provider conflict refusal, sensitive direct-tool path rules, serialized inferences, and injected recursion prohibition.
 - Direct-tool path denials and redaction apply only to the bridge-controlled `Read`/`Edit`/`Write` tools and text returned through the bridge. They do not sandbox, audit, or restrict configured plugins, MCP servers, hooks, browser integrations, or their own outbound channels; those components can have their own capabilities and configuration.
-- `claude_status.runtimeConfiguration` exposes the applied bridge launch policy: `safeMode=false`, `settingSources=normal/user-project-local`, `strictMcpConfig=false`, `chromeIntegration=operator-configured`, `pluginsAndMcpNotDisabledByBridge=true`, and `normalConfigurationLaunchPolicy=true`. It proves only that the bridge does not disable these surfaces; it does not prove that a particular operator component is installed, enabled, authenticated, healthy, or connected.
+- `claude_status.runtimeConfiguration` exposes the applied bridge launch policy: `safeMode=false`, `settingSources=normal/user-project-local`, `strictMcpConfig=false`, `chromeIntegration=operator-configured`, `pluginsAndMcpNotDisabledByBridge=true`, `normalConfigurationLaunchPolicy=true`, `fullAgentToolAvailabilityPolicy=operator_configuration`, and `planAndImplementToolAvailabilityPolicy=built_in_allowlist`. It proves only that the bridge does not disable these surfaces for `claude_full`; it does not prove that a particular operator component is installed, enabled, authenticated, healthy, or connected.
 - Claude inferences are serialized through an unbounded in-memory operation queue, output is bounded, and a process tree is terminated only by explicit cancellation, bridge-host shutdown, native failure, or provider failure. Clean idle sessions have no expiry and persist outside the plugin cache.
 - The reciprocal Codex bridge applies the same no-wall-timeout/no-idle-expiry operation and session lifecycle. It fixes the workspace to the Claude window's project, does not expose danger-full-access, and loads the operator's normal Codex configuration; enabled plugins, Apps, hooks, and MCP servers are part of its trust boundary. Its workspace binding, sandbox and approval policy do not sandbox, audit, or restrict those separately configured components or their own outbound channels.
 - Full-agent changes are real and have no automatic rollback. Use a disposable branch/worktree/VM for high-risk jobs and inspect the final diff.
@@ -490,7 +490,7 @@ The reciprocal tests also validate the Claude plugin manifests, fixed-workspace 
 - structured telemetry on success and failure, including `error_max_turns`, without claiming an observable effective effort;
 - unlimited-by-default continuation, explicit concise caps, stale retry prevention, and failure-closed handles;
 - identical versioned control catalogs, source hashes, 100/100 screenshot-command coverage, and 46/46 live headless-command coverage;
-- full-agent argv with `auto`, `default` tools, normal Claude configuration discovery, and the fixed model/effort/fallback policy;
+- full-agent and full-reply argv with no `--tools` narrowing, plan/implementation built-in allowlists, normal Claude configuration discovery, and the fixed model/effort/fallback policy;
 - read-only review and all isolated-worktree adversarial audits;
 - a fake-Claude mutation test in a disposable non-Git workspace;
 - current native Claude CLI parser compatibility without making an inference;

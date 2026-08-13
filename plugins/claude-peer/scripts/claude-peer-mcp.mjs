@@ -94,7 +94,6 @@ const PHASES = Object.freeze({
   },
   full: {
     permissionMode: "auto",
-    tools: "default",
   },
 });
 
@@ -1586,8 +1585,6 @@ function fullClaudeArguments(turns, resumeSessionId, extraPrompt, model, effort,
     "json",
     "--permission-mode",
     PHASES.full.permissionMode,
-    "--tools",
-    PHASES.full.tools,
   ];
   addModelAndEffort(args, model, effort, fallbackModels);
   args.push("--disallowedTools", ...SENSITIVE_TOOL_RULES);
@@ -2044,8 +2041,8 @@ async function claudeFull(args, progressToken, operationId, forceUnlimited = fal
   requireSubscriptionAuth(binary);
   enforceSerialInferenceInvariant();
   const modePrompt = replyLimit === null
-    ? "This full-agent session has no numerical cross-agent reply ceiling by default. You have all built-in Claude Code tools and may make user-authorized workspace changes. Continue productively until the task converges or the user stops it; do not spend ceremonial turns after convergence."
-    : `The user requested a concise or bounded full-agent collaboration with at most ${replyLimit} follow-up${replyLimit === 1 ? "" : "s"} after this response. Use built-in tools efficiently and prioritize the requested outcome.`;
+    ? "This full-agent session has no numerical cross-agent reply ceiling by default. You have the operator-configured Claude Code tool surface and may make user-authorized workspace changes. Continue productively until the task converges or the user stops it; do not spend ceremonial turns after convergence."
+    : `The user requested a concise or bounded full-agent collaboration with at most ${replyLimit} follow-up${replyLimit === 1 ? "" : "s"} after this response. Use the operator-configured Claude Code tool surface efficiently and prioritize the requested outcome.`;
   const turns = optionalMaxTurns(args);
   let processResult;
   let parsed;
@@ -2147,10 +2144,10 @@ async function claudeFullReply(args, progressToken, operationId) {
   persistSessions();
   const isFinalDeepReply = session.replyLimit !== null && nextReply === session.replyLimit;
   const replyPrompt = session.mode === "unlimited"
-    ? `This is full-agent continuation ${nextReply} in the default unlimited session. Use all built-in tools needed for the newest instruction and keep reporting concrete changes and verification.`
+    ? `This is full-agent continuation ${nextReply} in the default unlimited session. Use the operator-configured Claude Code tool surface needed for the newest instruction and keep reporting concrete changes and verification.`
     : isFinalDeepReply
       ? `This is full-agent bounded continuation ${nextReply} of ${session.replyLimit}, the final requested follow-up. Finish the strongest remaining implementation or verification work and give Codex a precise handoff.`
-      : `This is full-agent bounded continuation ${nextReply} of ${session.replyLimit}. Continue the task using built-in tools as needed and address Codex's newest evidence or instruction.`;
+      : `This is full-agent bounded continuation ${nextReply} of ${session.replyLimit}. Continue the task using the operator-configured Claude Code tool surface as needed and address Codex's newest evidence or instruction.`;
   let processResult;
   let parsed;
   let content;
@@ -2365,12 +2362,13 @@ async function claudeStatus() {
     bridgeWallClockTimeout: null,
     operationPollingTool: "claude_operation",
     explicitCancellationTool: "claude_operation_cancel",
+    toolAvailabilityPolicy: "built_in_allowlist",
   };
   const fullAgentPolicy = {
     available: true,
     proactiveInvocationAllowed: true,
     permissionMode: PHASES.full.permissionMode,
-    tools: PHASES.full.tools,
+    toolAvailabilityPolicy: "operator_configuration",
     defaultReplyLimit: null,
     unlimitedModeAvailable: true,
     conciseModeAvailableWithMaxFollowUps: true,
@@ -2396,6 +2394,8 @@ async function claudeStatus() {
     chromeIntegration: "operator-configured",
     pluginsAndMcpNotDisabledByBridge: true,
     normalConfigurationLaunchPolicy: true,
+    fullAgentToolAvailabilityPolicy: "operator_configuration",
+    planAndImplementToolAvailabilityPolicy: "built_in_allowlist",
   };
   const conflicts = billedAuthConflicts();
   let allowedRoots = [];
@@ -2763,7 +2763,7 @@ async function handleRequest(message) {
         protocolVersion: SUPPORTED_PROTOCOL_VERSIONS.has(params?.protocolVersion) ? params.protocolVersion : PROTOCOL_VERSION,
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-        instructions: `Claude may be invoked proactively whenever it materially improves the user's in-scope task. New sessions default to unlimited cross-agent follow-ups, Fable at max effort, and ordered Opus/Sonnet availability fallback. Set maxFollowUps only when the top-level user asks for concise, bounded, or an exact number of rounds. Inference tools return an operation handle immediately: poll claude_operation until terminal state, and use claude_operation_cancel only after an explicit cancellation request. The bridge applies no wall-clock timeout and never expires idle sessions; claude_session_close is the explicit disconnect path. Inspect modelVerification, modelsUsed/modelUsage, and effortVerification; never retry a refusal to evade safeguards. Use claude_capabilities to query the versioned Claude/Codex control catalog and honor each entry's access route—known terminal UI commands are not automatically MCP tools. Use claude_full for a persistent full built-in Claude Code agent that can edit files and run commands in ${rootScopeWording().agentScope}; use read-only review when mutation is not authorized. During a Codex /btw side question, preserve the in-flight Claude inference and answer the aside without cancelling or steering the original work.`,
+        instructions: `Claude may be invoked proactively whenever it materially improves the user's in-scope task. New sessions default to unlimited cross-agent follow-ups, Fable at max effort, and ordered Opus/Sonnet availability fallback. Set maxFollowUps only when the top-level user asks for concise, bounded, or an exact number of rounds. Inference tools return an operation handle immediately: poll claude_operation until terminal state, and use claude_operation_cancel only after an explicit cancellation request. The bridge applies no wall-clock timeout and never expires idle sessions; claude_session_close is the explicit disconnect path. Inspect modelVerification, modelsUsed/modelUsage, and effortVerification; never retry a refusal to evade safeguards. Use claude_capabilities to query the versioned Claude/Codex control catalog and honor each entry's access route—known terminal UI commands are not automatically MCP tools. Use claude_full for a persistent Claude Code agent with the operator-configured tool surface that can edit files and run commands in ${rootScopeWording().agentScope}; use read-only review when mutation is not authorized. During a Codex /btw side question, preserve the in-flight Claude inference and answer the aside without cancelling or steering the original work.`,
       },
     };
   }
