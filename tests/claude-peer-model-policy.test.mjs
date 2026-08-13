@@ -91,6 +91,19 @@ async function pollClaudeOperation(server, queued, timeoutMs = null) {
   throw new Error(`Claude operation ${queued.operationHandle} did not complete within the test waiter window.`);
 }
 
+test("all Claude peer launch phases use the operator's normal Claude configuration", () => {
+  const source = readFileSync(serverPath, "utf8");
+  const launchBuilders = source.slice(source.indexOf("function claudeArguments("), source.indexOf("function parseClaudeResult("));
+
+  for (const disabledOption of ["--safe-mode", "--setting-sources", "--strict-mcp-config", "--no-chrome"]) {
+    assert.doesNotMatch(launchBuilders, new RegExp(`"${disabledOption}"`), disabledOption);
+  }
+  assert.match(launchBuilders, /"--permission-mode"/);
+  assert.match(launchBuilders, /"--tools"/);
+  assert.match(launchBuilders, /addModelAndEffort/);
+  assert.match(launchBuilders, /"--disallowedTools"/);
+});
+
 test("session-start schemas advertise the strongest default and current choices", async (t) => {
   const server = startServer();
   t.after(() => server.close());

@@ -109,7 +109,12 @@ test("catalog normalizes malformed rows, aliases, drifted probes, and angle plac
   assert.ok(catalog.runtimeObservations.claudeHeadlessSkills.includes("keybindings-help"));
   assert.ok(catalog.runtimeObservations.claudeHeadlessSkills.includes("deep-research"));
   assert.equal(find("claude", "cli-command", "claude").access, "host-cli-only");
-  assert.equal(find("claude", "cli-option", "--no-chrome").access, "bridge-runtime");
+  for (const option of ["--safe-mode", "--setting-sources", "--strict-mcp-config", "--no-chrome"]) {
+    assert.equal(find("claude", "cli-option", option).access, "host-launch-only", option);
+  }
+  for (const option of ["--config", "--disable"]) {
+    assert.equal(find("codex", "cli-option", option).access, "host-launch-only", option);
+  }
   assert.equal(find("codex", "cli-command", "codex exec").access, "host-cli-only");
   assert.equal(find("codex", "cli-command", "codex login").access, "bridge-runtime");
   assert.equal(find("codex", "cli-command", "codex mcp-server").access, "bridge-runtime");

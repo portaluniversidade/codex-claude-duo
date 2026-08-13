@@ -234,10 +234,11 @@ test("codex_status verifies the authenticated official MCP server without infere
     assert.equal(status.collaborationPolicy.defaultMode, "unlimited");
     assert.equal(status.collaborationPolicy.bridgeWallClockTimeout, null);
     assert.equal(status.collaborationPolicy.idleDisconnectPolicy, "never");
-    assert.equal(status.recursionPrevention.pluginsDisabled, true);
-    assert.equal(status.recursionPrevention.appsDisabled, true);
-    assert.equal(status.recursionPrevention.hooksDisabled, true);
-    assert.equal(status.recursionPrevention.configuredMcpServersCleared, true);
+    assert.equal(status.recursionPrevention.pluginsDisabled, false);
+    assert.equal(status.recursionPrevention.appsDisabled, false);
+    assert.equal(status.recursionPrevention.hooksDisabled, false);
+    assert.equal(status.recursionPrevention.configuredMcpServersCleared, false);
+    assert.equal(status.recursionPrevention.normalConfigurationNotDisabledByBridge, true);
     assert.equal(status.recursionPrevention.developerInstructionApplied, true);
     assert.equal(status.recursionPrevention.shellLaunchProhibitedByInstructionOnly, true);
   } finally {
@@ -258,11 +259,13 @@ test("Claude plugin metadata and skill describe the enforced reciprocal boundary
   assert.match(JSON.parse(mcp).mcpServers["codex-peer"].args[0], /CLAUDE_PLUGIN_ROOT/);
   assert.match(skill, /USER GOAL/);
   assert.match(skill, /Claude -> Codex -> Claude recursion/);
-  assert.match(source, /"--disable", "plugins"/);
-  assert.match(source, /"--disable", "apps"/);
-  assert.match(source, /"--disable", "hooks"/);
-  assert.match(source, /"mcp_servers=\{\}"/);
-  assert.match(source, /sandbox_workspace_write\.network_access=false/);
+  const launchBuilder = source.slice(source.indexOf("async start()"), source.indexOf("onLine(line)"));
+  for (const disabledOption of ["--disable", "mcp_servers={}", "shell_environment_policy.inherit=\"core\""]) {
+    assert.doesNotMatch(launchBuilder, new RegExp(disabledOption.replace(/[{}]/g, "\\$&")), disabledOption);
+  }
+  assert.doesNotMatch(launchBuilder, /sandbox_workspace_write\.network_access=false/);
+  assert.doesNotMatch(source, /sandbox_workspace_write\.network_access=false/);
+  assert.match(source, /networkAccessPolicy: "operator_configuration"/);
 });
 
 test("idle Codex sessions persist across bridge restarts until explicitly closed", async (t) => {

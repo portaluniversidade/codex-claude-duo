@@ -1698,8 +1698,8 @@
       "name": "--no-chrome",
       "syntax": "--no-chrome",
       "purpose": "Disable Chrome browser integration for this session",
-      "access": "bridge-runtime",
-      "route": "The Claude bridge uses this exact option internally; callers use the policy-bound MCP schema rather than passing raw argv.",
+      "access": "host-launch-only",
+      "route": "This is a native Claude launch option and is not accepted as arbitrary peer input.",
       "source": "https://code.claude.com/docs/en/cli-usage.md"
     },
     {
@@ -1851,8 +1851,8 @@
       "name": "--safe-mode",
       "syntax": "--safe-mode",
       "purpose": "Start with all customizations disabled to troubleshoot a broken configuration: CLAUDE.md, skills, plugins, hooks, MCP servers, custom commands and agents, output styles, workflows, custom themes, custom keybindings, status line and file-suggestion commands, LSP servers, and auto memory do not load.",
-      "access": "bridge-runtime",
-      "route": "The Claude bridge uses this exact option internally; callers use the policy-bound MCP schema rather than passing raw argv.",
+      "access": "host-launch-only",
+      "route": "This is a native Claude launch option and is not accepted as arbitrary peer input.",
       "source": "https://code.claude.com/docs/en/cli-usage.md"
     },
     {
@@ -1871,8 +1871,8 @@
       "name": "--setting-sources",
       "syntax": "--setting-sources",
       "purpose": "Comma-separated list of setting sources to load (user, project, local)",
-      "access": "bridge-runtime",
-      "route": "The Claude bridge uses this exact option internally; callers use the policy-bound MCP schema rather than passing raw argv.",
+      "access": "host-launch-only",
+      "route": "This is a native Claude launch option and is not accepted as arbitrary peer input.",
       "source": "https://code.claude.com/docs/en/cli-usage.md"
     },
     {
@@ -1891,8 +1891,8 @@
       "name": "--strict-mcp-config",
       "syntax": "--strict-mcp-config",
       "purpose": "Only use MCP servers from --mcp-config, ignoring all other MCP configurations",
-      "access": "bridge-runtime",
-      "route": "The Claude bridge uses this exact option internally; callers use the policy-bound MCP schema rather than passing raw argv.",
+      "access": "host-launch-only",
+      "route": "This is a native Claude launch option and is not accepted as arbitrary peer input.",
       "source": "https://code.claude.com/docs/en/cli-usage.md"
     },
     {
@@ -4978,8 +4978,8 @@
       "name": "--config",
       "syntax": "--config, -c",
       "purpose": "Override configuration values. Values parse as TOML if possible; otherwise the literal string is used.",
-      "access": "bridge-runtime",
-      "route": "The reciprocal bridge uses this exact option internally while starting the official Codex MCP server.",
+      "access": "host-launch-only",
+      "route": "Use in a trusted local Codex terminal; the peer does not expose a generic Codex CLI shell.",
       "source": "https://developers.openai.com/codex/codex-manual.md"
     },
     {
@@ -5011,8 +5011,8 @@
       "name": "--disable",
       "syntax": "--disable",
       "purpose": "Force-disable a feature flag (translates to -c features.=false). Repeatable.",
-      "access": "bridge-runtime",
-      "route": "The reciprocal bridge uses this exact option internally while starting the official Codex MCP server.",
+      "access": "host-launch-only",
+      "route": "Use in a trusted local Codex terminal; the peer does not expose a generic Codex CLI shell.",
       "source": "https://developers.openai.com/codex/codex-manual.md"
     },
     {

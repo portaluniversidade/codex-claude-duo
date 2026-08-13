@@ -388,8 +388,7 @@ for (const row of claudeCliCommands) {
 const claudeCliFlags = firstTable(section(claudeCli, "## CLI flags").text);
 const mappedClaudeFlags = new Set([
   "--allowedTools", "--append-system-prompt", "--disallowedTools", "--effort", "--fallback-model",
-  "--max-turns", "--model", "--no-chrome", "--output-format", "--permission-mode", "--resume", "--safe-mode", "--setting-sources",
-  "--strict-mcp-config", "--tools",
+  "--max-turns", "--model", "--output-format", "--permission-mode", "--resume", "--tools",
 ]);
 for (const row of claudeCliFlags) {
   const syntax = plain(row.Flag || row.Option || Object.values(row)[0]);
@@ -452,7 +451,7 @@ for (const [name, purpose] of screenshotShortcuts) {
 
 const codexCliReference = section(codexManual, "### CLI command reference").text;
 const codexGlobalFlags = firstTable(section(codexCliReference, "#### Global flags").text);
-const runtimeCodexFlags = new Set(["--config", "-c", "--disable"]);
+const runtimeCodexFlags = new Set();
 const equivalentCodexFlags = new Set(["--ask-for-approval", "-a", "--cd", "-C", "--model", "-m", "--sandbox", "-s"]);
 for (const row of codexGlobalFlags) {
   const syntax = plain(row.Key);
@@ -909,7 +908,7 @@ const catalog = {
     claim: "Complete for the explicitly enumerated command, flag, shortcut, deep-link, IDE, hardware, security, bridge, and live-probe surfaces in the cited snapshots; not a timeless promise about conditional or future controls.",
     rule: "A command is not called remotely merely because its name is known. Use each entry's access and route fields.",
     dynamicAvailability: "Platform, plan, organization policy, feature flags, installed plugins, MCP servers, and host surface can add, hide, or remove commands.",
-    recursionBoundary: "Nested MCP/plugin/app/hook routes are technically disabled in the reciprocal Codex launch. Shell-level peer launch is also prohibited by both peers' developer instructions, but that part is instruction enforcement rather than an operating-system impossibility. Unlimited collaboration is serialized through durable operation handles.",
+    recursionBoundary: "Both peer launches use the operator's normal configuration, so enabled MCP/plugin/app/hook routes are part of the session trust boundary. Coordinator-to-coordinator launch is prohibited by both peers' developer instructions, which is instruction enforcement rather than an operating-system impossibility. Unlimited collaboration is serialized through durable operation handles.",
   },
   sources: [
     claudeCommandsUrl,
