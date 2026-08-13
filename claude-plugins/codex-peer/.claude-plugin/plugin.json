@@ -1,0 +1,17 @@
+{
+  "name": "codex-peer",
+  "version": "0.1.4",
+  "description": "Invoke a persistent, policy-bound Codex peer from Claude Code for independent review, implementation, and verification.",
+  "author": {
+    "name": "Portal Universidade"
+  },
+  "homepage": "https://github.com/portaluniversidade/codex-claude-duo",
+  "repository": "https://github.com/portaluniversidade/codex-claude-duo",
+  "keywords": [
+    "codex",
+    "claude",
+    "mcp",
+    "collaboration",
+    "multi-agent"
+  ]
+}

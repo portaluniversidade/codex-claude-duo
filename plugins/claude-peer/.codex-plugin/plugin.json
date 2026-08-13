@@ -1,10 +1,13 @@
 {
   "name": "claude-peer",
-  "version": "0.4.1+codex.20260813124712",
-  "description": "Proactively collaborate with a Fable-first, max-effort Claude Code agent with observable model evidence and ordered Opus/Sonnet fallback.",
+  "version": "0.4.1+codex.20260813122556",
+  "description": "Proactively collaborate with Claude Code as one half of a bidirectional, recursion-safe Codex and Claude bridge.",
   "author": {
-    "name": "Local Codex user"
+    "name": "Portal Universidade",
+    "url": "https://github.com/portaluniversidade"
   },
+  "homepage": "https://github.com/portaluniversidade/codex-claude-duo",
+  "repository": "https://github.com/portaluniversidade/codex-claude-duo",
   "keywords": [
     "claude",
     "codex",
@@ -16,8 +19,8 @@
   "interface": {
     "displayName": "Claude Peer",
     "shortDescription": "Fable-first Claude at max effort with verified fallback.",
-    "longDescription": "Adds a local Max-subscription bridge from Codex to a proactive full built-in Claude Code agent that can edit files, run commands, and use built-in web tools in approved workspaces. It defaults to Fable at max effort, exposes current aliases and exact model presets including Opus 5, configures ordered Opus/Sonnet availability fallback, and reports requested settings separately from observed per-model usage. It also includes six-follow-up read-only review, explicit no-round-cap modes, and one-use path-scoped worktree authorization for conservative edits.",
-    "developerName": "Local Codex user",
+    "longDescription": "Adds the Codex-to-Claude half of a local bidirectional bridge. Codex can invoke a proactive full Claude Code agent for in-scope work, while the companion Claude Code plugin lets an interactive Claude window invoke a policy-bound Codex peer. Both directions use persistent bounded sessions, explicit uncapped modes, independent verification, and technical recursion prevention.",
+    "developerName": "Portal Universidade",
     "category": "Productivity",
     "capabilities": [
       "Interactive",
@@ -27,8 +30,7 @@
     "defaultPrompt": [
       "Bring in the full Claude Code agent with Fable at max effort, verify the observed model evidence, and implement and test this with you.",
       "Use Opus 5 at max effort for this task and report any model fallback.",
-      "Have Claude independently challenge this plan through the full default review depth.",
-      "Use unlimited full-agent back-and-forth with Claude and no numerical reply cap."
+      "Explain and verify the reciprocal Claude-to-Codex bridge."
     ]
   }
 }
