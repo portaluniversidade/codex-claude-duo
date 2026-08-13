@@ -2,7 +2,8 @@
 param(
     [switch]$InstallCLIs,
     [switch]$LoginClaude,
-    [switch]$InstallCodexPlugin
+    [switch]$InstallCodexPlugin,
+    [switch]$InstallClaudePlugin
 )
 
 Set-StrictMode -Version Latest
@@ -204,6 +205,24 @@ function Get-CodexInstalledPlugin {
     return @($data.installed | Where-Object { $_.pluginId -eq $PluginId }) | Select-Object -First 1
 }
 
+function Get-ClaudeMarketplaces {
+    param([Parameter(Mandatory = $true)][string]$ClaudeBinary)
+
+    $result = Invoke-NativeCapture -FilePath $ClaudeBinary -Arguments @('plugin', 'marketplace', 'list', '--json')
+    if ($result.ExitCode -ne 0) { throw "Could not inspect Claude Code marketplaces: $($result.Output)" }
+    try { return @($result.Output | ConvertFrom-Json) }
+    catch { throw 'Claude Code marketplace listing was not valid JSON.' }
+}
+
+function Get-ClaudeInstalledPlugins {
+    param([Parameter(Mandatory = $true)][string]$ClaudeBinary)
+
+    $result = Invoke-NativeCapture -FilePath $ClaudeBinary -Arguments @('plugin', 'list', '--json')
+    if ($result.ExitCode -ne 0) { throw "Could not inspect installed Claude Code plugins: $($result.Output)" }
+    try { return @($result.Output | ConvertFrom-Json) }
+    catch { throw 'Claude Code plugin listing was not valid JSON.' }
+}
+
 function Get-RawSha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -333,6 +352,49 @@ if ($InstallCodexPlugin) {
     }
 }
 
+if ($InstallClaudePlugin) {
+    if (-not $claude) { throw 'Claude Code is not installed or not callable.' }
+    if (-not $codex) { throw 'A standalone Codex CLI is required by the reciprocal Claude Code plugin.' }
+    if (-not (Get-CompatibleNodeBinary)) { throw 'Node.js 18 or newer is required to run the reciprocal Codex MCP bridge.' }
+
+    $marketplaceName = 'codex-claude-duo'
+    $pluginId = "codex-peer@$marketplaceName"
+    $canonicalBundle = Get-NormalizedExistingPath -Path $BundleRoot
+    $marketplaces = Get-ClaudeMarketplaces -ClaudeBinary $claude
+    $registration = @($marketplaces | Where-Object { $_.name -eq $marketplaceName }) | Select-Object -First 1
+    if ($registration) {
+        if ($registration.source -ne 'directory' -or -not $registration.path) {
+            throw "Claude Code marketplace $marketplaceName is already registered from a non-local source; it was left unchanged."
+        }
+        $registeredRoot = Get-NormalizedExistingPath -Path $registration.path
+        if (-not $registeredRoot.Equals($canonicalBundle, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Claude Code marketplace $marketplaceName points to '$registeredRoot', not this reviewed bundle '$canonicalBundle'. It was left unchanged."
+        }
+        Write-Host "Confirmed Claude Code marketplace $marketplaceName at $canonicalBundle."
+    } elseif ($PSCmdlet.ShouldProcess($canonicalBundle, "Register user-scoped Claude Code marketplace $marketplaceName")) {
+        $added = Invoke-NativeCapture -FilePath $claude -Arguments @('plugin', 'marketplace', 'add', '--scope', 'user', $canonicalBundle)
+        if ($added.ExitCode -ne 0) { throw "Claude Code marketplace registration failed: $($added.Output)" }
+    }
+
+    $installedPlugins = Get-ClaudeInstalledPlugins -ClaudeBinary $claude
+    $installedPeer = @($installedPlugins | Where-Object { $_.id -eq $pluginId -and $_.scope -eq 'user' }) | Select-Object -First 1
+    if ($installedPeer) {
+        if ($PSCmdlet.ShouldProcess($pluginId, 'Refresh user-scoped Claude Code plugin from the reviewed local marketplace')) {
+            $updated = Invoke-NativeCapture -FilePath $claude -Arguments @('plugin', 'update', '--scope', 'user', $pluginId)
+            if ($updated.ExitCode -ne 0) { throw "Claude Code plugin update failed: $($updated.Output)" }
+        }
+    } elseif ($PSCmdlet.ShouldProcess($pluginId, 'Install user-scoped Claude Code plugin')) {
+        $installed = Invoke-NativeCapture -FilePath $claude -Arguments @('plugin', 'install', '--scope', 'user', $pluginId)
+        if ($installed.ExitCode -ne 0) { throw "Claude Code plugin installation failed: $($installed.Output)" }
+    }
+
+    $selected = @(Get-ClaudeInstalledPlugins -ClaudeBinary $claude | Where-Object {
+        $_.id -eq $pluginId -and $_.scope -eq 'user' -and $_.enabled
+    }) | Select-Object -First 1
+    if (-not $selected) { throw 'Claude Code reported installation success, but the reciprocal codex-peer plugin is not enabled at user scope.' }
+    Write-Host "Installed and verified Claude Code plugin $($selected.id) $($selected.version)."
+}
+
 $billingVariables = @(
     'ANTHROPIC_API_KEY',
     'ANTHROPIC_AUTH_TOKEN',
@@ -383,8 +445,12 @@ $node = Get-CompatibleNodeBinary
     Bundle                   = $BundleRoot
     DefaultClaudeWorkspace   = $DefaultClaudeWorkspace
     DefaultWorkspaceExists   = [System.IO.Directory]::Exists($DefaultClaudeWorkspace)
+    ClaudeCodexPeer          = if ($InstallClaudePlugin) { 'installed and enabled at user scope' } else { 'not changed' }
 } | Format-List
 
 if ($InstallCodexPlugin) {
     Write-Host 'Start a new Codex task after installation so the plugin tools and skill are loaded.'
+}
+if ($InstallClaudePlugin) {
+    Write-Host 'Start a new Claude Code window after installation so the reciprocal Codex tools and skill are loaded.'
 }

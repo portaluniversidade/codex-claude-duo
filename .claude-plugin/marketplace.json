@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "codex-claude-duo",
+  "description": "Bidirectional local collaboration between Claude Code and Codex.",
+  "owner": {
+    "name": "Portal Universidade"
+  },
+  "plugins": [
+    {
+      "name": "codex-peer",
+      "description": "Let Claude Code invoke a policy-bound Codex peer through Codex's official MCP server.",
+      "author": {
+        "name": "Portal Universidade"
+      },
+      "category": "development",
+      "source": "./claude-plugins/codex-peer",
+      "homepage": "https://github.com/portaluniversidade/codex-claude-duo"
+    }
+  ]
+}

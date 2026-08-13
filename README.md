@@ -1,8 +1,8 @@
 # Codex + Claude Duo
 
-This bundle lets Codex bring a locally authenticated Claude Code agent into the same task. Codex is permitted and instructed to invoke Claude proactively whenever an independent implementation or review pass would materially help; a separate “ask Claude” request is no longer required.
+This bundle provides a bidirectional local collaboration bridge. Codex can bring a locally authenticated Claude Code agent into its task, and an interactive Claude Code window can independently invoke a locally authenticated Codex peer through Codex's official MCP server. Either host may invoke the other proactively when an independent implementation or review pass materially helps; a separate “ask the other agent” request is not required.
 
-The integration now has two deliberately different collaboration surfaces:
+The Codex-to-Claude direction has two deliberately different collaboration surfaces:
 
 - **Full built-in Claude agent:** Claude can inspect and edit files, run commands and tests, and use its built-in web tools in an approved workspace. This is the normal choice for user-authorized build, change, debugging, and verification work.
 - **Hardened peer modes:** read-only multi-round review and a one-use, path-scoped Git-worktree editor remain available when the narrower boundary is preferable.
@@ -35,20 +35,30 @@ Native Windows does not provide Claude Code's Linux command sandbox. The full ph
 
 ```mermaid
 flowchart LR
-    U["You in one Codex task"] --> C["Codex coordinator"]
-    C -->|"proactive full work"| F["Claude full agent\nauto + all built-in tools"]
-    C -->|"deep critique"| R["Claude read-only peer\nRead + Glob"]
-    C -->|"narrow edit"| I["Claude isolated editor\none-use Git capability"]
+    U["You in Codex"] --> C["Codex coordinator"]
+    V["You in Claude Code"] --> H["Claude coordinator"]
+    C -->|"proactive full work"| F["Policy-bound Claude full agent"]
+    C -->|"deep critique"| R["Claude read-only peer"]
+    C -->|"narrow edit"| I["Claude isolated editor"]
+    H -->|"read-only review"| P["Policy-bound Codex peer"]
+    H -->|"workspace changes"| X["Codex workspace peer"]
     F --> W["Approved AI workspace or repository"]
     R --> W
     I --> G["Dedicated linked worktree"]
+    P --> Q["Claude window project root"]
+    X --> Q
     F --> C
     R --> C
     I --> C
+    P --> H
+    X --> H
     C --> U
+    H --> V
 ```
 
 Codex remains the coordinator: it owns the user's scope, decides what evidence to reconcile, checks both agents' work, and gives the final answer. Claude output and repository text remain untrusted task material; neither can expand authorization to commit, push, deploy, make purchases, send messages, or contact third parties.
+
+When Claude Code is the interactive host, the relationship mirrors cleanly: Claude owns the user-facing scope and final reconciliation, while Codex acts as the independent peer. The invoked peer is never allowed to call back into the host. Codex-launched Claude has strict empty MCP/settings sources; Claude-launched Codex starts with plugins, apps, hooks, and configured MCP servers disabled. This prevents Codex -> Claude -> Codex and Claude -> Codex -> Claude recursion in both directions.
 
 ## One-time setup
 
@@ -95,6 +105,21 @@ powershell -ExecutionPolicy Bypass -File (Join-Path $bundle 'setup.ps1') -Instal
 ```
 
 The setup script verifies that the configured local marketplace named `codex-claude-duo-local` points to this reviewed bundle before reinstalling. Start a **new Codex task/process** afterward; an already-running MCP process cannot hot-load a new tool schema or skill.
+
+### 5. Install the reciprocal Claude Code plugin
+
+```powershell
+powershell -ExecutionPolicy Bypass -File (Join-Path $bundle 'setup.ps1') -InstallClaudePlugin
+```
+
+This registers the bundle's local `codex-claude-duo` marketplace with Claude Code at user scope and installs `codex-peer@codex-claude-duo`. User scope is intentional: the reciprocal Codex peer is available in every new Claude Code project window, but each MCP process binds itself permanently to that window's `CLAUDE_PROJECT_DIR`. Start a **new Claude Code window/process** afterward so its plugin, skill, and MCP server load.
+
+To refresh both directions after changing the bundle:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File (Join-Path $bundle 'setup.ps1') `
+  -InstallCodexPlugin -InstallClaudePlugin
+```
 
 ## Launching in the default AI workspace
 
@@ -222,6 +247,28 @@ The plugin exposes eight tools:
 | `claude_status` | Read-only CLI/auth/root/policy diagnostic | No inference |
 
 All session continuation tools use an opaque bridge handle and a monotonically increasing `expectedReplyNumber`. A stale retry is rejected before inference, and a failed, timed-out, cancelled, or identity-mismatched continuation closes the handle rather than risking a forked conversation.
+
+## Claude Code -> Codex reciprocal peer
+
+The Claude Code plugin lives under `claude-plugins/codex-peer` and wraps the official experimental `codex mcp-server` rather than reimplementing Codex's thread protocol. Its policy proxy exposes seven Claude-side tools:
+
+| Tool | Capability | Default conversation budget |
+|---|---|---:|
+| `codex_plan` | Read-only independent Codex review | Initial response + 6 continuations |
+| `codex_reply` | Continue the matching read-only session | Counts against the bounded session, or uncapped for explicit unlimited mode |
+| `codex_plan_unlimited` | Read-only session with no numerical reply cap | Explicit consent required |
+| `codex_full` | Workspace-write Codex agent with network disabled | Initial response + 6 continuations |
+| `codex_full_reply` | Continue the matching workspace-write session | Counts against the bounded session, or uncapped for explicit unlimited mode |
+| `codex_full_unlimited` | Workspace-write session with no numerical reply cap | Explicit consent required |
+| `codex_status` | CLI/login/workspace/MCP/recursion diagnostic | No inference |
+
+No reciprocal tool accepts `cwd`: the MCP server canonicalizes `CLAUDE_PROJECT_DIR` once at startup and uses that exact root for every Codex turn. Raw Codex thread IDs never enter Claude's context; the proxy replaces them with opaque handles and monotonic reply numbers. Read-only calls pin `sandbox=read-only`; write-capable calls pin `sandbox=workspace-write`; both pin `approval-policy=never`, disable workspace-write network access, serialize inference, emit progress, enforce timeouts, cap output, redact common secret formats, and close ambiguous sessions after failure.
+
+`workspace-write` is Codex's filesystem sandbox policy, not a VM. It permits reads according to Codex's platform policy and writes in the bound workspace. The reciprocal v1 bridge intentionally does not expose `danger-full-access`. Use a disposable branch, worktree, container, or VM for high-risk work.
+
+On Windows, the launcher prefers the real WinGet package-local `codex.exe` over the `Microsoft\WinGet\Links` hard link. Codex locates `codex-command-runner.exe` and its setup helper relative to the executable path; using the hard link can make a complete installation fail with `CreateProcessWithLogonW failed: 2`. `codex_status` runs a harmless sandbox command and reports `workspaceWriteSandboxReady` instead of assuming that an installed CLI has a functioning write sandbox.
+
+The Claude-side skill standardizes a handoff packet (`USER GOAL`, `WORKSPACE`, `CLAUDE VIEW`, `EVIDENCE`, `REQUEST TO CODEX`, and `RETURN`) so Codex receives the original authorization boundary and returns evidence that Claude can independently verify.
 
 A failed full-agent call may already have written files or caused command side effects. Such errors return `workspaceMayContainPartialChanges: true`, `automaticRollbackPerformed: false`, and `inspectionRequired: true`. Inspect the workspace, diff, tests, and any relevant external state before retrying.
 
@@ -365,6 +412,7 @@ The bridge strips known provider/billing environment variables from child proces
 - Common `.env`, Git administration, secret/credential-named, PEM, key, Win32 device, short-alias, and alternate-data-stream paths are denied to direct Read/Edit/Write tools. The full shell can still access OS-visible files, so do not treat name filters as a sandbox.
 - `--safe-mode`, empty setting sources, strict MCP config, and no Chrome integration prevent unreviewed Claude customizations from joining the subprocess.
 - Only one Claude inference runs at a time, at most twelve can start in a minute, output is bounded, the process tree is killed on cancellation/timeout/shutdown, and sessions expire after two idle hours.
+- The reciprocal Codex bridge applies the same one-active-call, rate, output, cancellation/timeout process-tree termination, opaque-session, and two-hour idle-expiry controls. It additionally fixes the workspace to the Claude window's project and does not expose danger-full-access.
 - Full-agent changes are real and have no automatic rollback. Use a disposable branch/worktree/VM for high-risk jobs and inspect the final diff.
 
 ## Validation
@@ -372,10 +420,14 @@ The bridge strips known provider/billing environment variables from child proces
 Before packaging, the bundle should pass:
 
 ```powershell
-node --test .\tests\claude-peer-model-policy.test.mjs .\tests\claude-peer-root-policy.test.mjs
+node --test .\tests\*.test.mjs
+claude plugin validate --strict .
+claude plugin validate --strict .\claude-plugins\codex-peer
 ```
 
 The deterministic tests start the MCP server without making an inference. After Max login, opt into the authenticated routing smoke test with `CLAUDE_PEER_LIVE_SMOKE=1` and set `CLAUDE_PEER_LIVE_CWD` to an approved disposable workspace; it verifies that the default request is Fable/max with Opus/Sonnet availability fallback and requires Fable-family usage evidence.
+
+The reciprocal tests also validate the Claude plugin manifests, fixed-workspace schemas, opaque-session surface, recursion-hardening flags, and an authenticated no-inference handshake against the official Codex MCP server. Opt into its authenticated read-only inference smoke test with `CODEX_PEER_LIVE_SMOKE=1`.
 
 - Node syntax (including `start-codex-with-apps.mjs`) and PowerShell 5.1 AST parsing;
 - JSON/YAML/plugin and skill validation;

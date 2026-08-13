@@ -5,7 +5,7 @@ description: Use a locally authenticated Claude Code agent whenever an independe
 
 # Claude Peer
 
-Use Claude as an independent collaborator while Codex remains responsible for the user's scope, verification, and final answer. Claude must never launch Codex, Claude, or another coordinator.
+Use Claude as an independent collaborator while Codex remains responsible for the user's scope, verification, and final answer. A Claude process launched through this bridge must never launch Codex, Claude, or another coordinator. Its strict empty MCP/settings boundary makes that a technical recursion constraint, not only an instruction. Separately, an interactive Claude Code window may use the companion `codex-peer` plugin to start one policy-bound Codex peer.
 
 ## Protocol
 
@@ -20,6 +20,12 @@ Use Claude as an independent collaborator while Codex remains responsible for th
 6. Preserve an in-flight Claude inference while the user asks a quick side question through Codex's `/btw` command. Answer that aside without cancelling, replacing, or steering the active Claude work, then continue waiting for and reconciling the original result. When Claude is doing long-running work and a quick unrelated question would otherwise interrupt the task, remind the user that `/btw` is the non-interrupting route. An explicit request to stop or replace the task remains authoritative.
 7. Inspect every inference result's `modelVerification`, `modelsUsed`, `modelUsage`, and `effortVerification` before relying on it; say when a fallback or unverifiable setting was observed.
 8. Reconcile both agents' work, inspect the actual changes, run proportionate verification, and report residual disagreement or uncertainty.
+
+## Reciprocal Claude Code integration
+
+The bundle also ships a separate Claude Code plugin named `codex-peer`. In an interactive Claude Code window it exposes a policy proxy around Codex's official `codex mcp-server`, so Claude may proactively request read-only review or user-authorized workspace changes and continue the returned session through an opaque handle.
+
+The two directions deliberately cannot nest. Claude launched by this `claude-peer` bridge receives empty setting sources, strict MCP configuration, and an explicit prohibition on launching another coordinator. Codex launched by Claude's `codex-peer` bridge starts with Codex plugins, apps, hooks, and configured MCP servers disabled. Either interactive host may invoke the other once; the invoked peer cannot call back and form a recursion loop.
 
 ## Capability-first model policy
 
