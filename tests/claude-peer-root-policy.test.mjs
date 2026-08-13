@@ -226,6 +226,8 @@ test("claude_status reports the effective root policy and its unaffected safegua
     chromeIntegration: "operator-configured",
     pluginsAndMcpNotDisabledByBridge: true,
     normalConfigurationLaunchPolicy: true,
+    fullAgentToolAvailabilityPolicy: "operator_configuration",
+    planAndImplementToolAvailabilityPolicy: "built_in_allowlist",
   });
   assert.equal(status.rootPolicy.allowAllRoots, true);
   assert.equal(status.rootPolicy.mode, "all-roots");
